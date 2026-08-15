@@ -1,0 +1,22 @@
+services:
+  webpo:
+    image: ${WEBPO_IMAGE:-ghcr.io/ashton318/webpo-generator:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: webpo-generator
+    ports:
+      - "${PORT:-8080}:${PORT:-8080}"
+    environment:
+      - NODE_ENV=production
+      - HOST=${HOST:-::}
+      - PORT=${PORT:-8080}
+      - WORKERS=${WORKERS:-1}
+      - QUEUE_SIZE=${QUEUE_SIZE:-32}
+      - MAX_PENDING_REQUESTS=${MAX_PENDING_REQUESTS:-256}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30000}
+      - CACHE_SIZE=${CACHE_SIZE:-100}
+      - CACHE_TTL=${CACHE_TTL:-300000}
+      - VISITOR_TTL=${VISITOR_TTL:-36000000}
+      - API_TOKEN=${API_TOKEN:-}
+    restart: unless-stopped
