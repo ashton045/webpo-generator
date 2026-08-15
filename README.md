@@ -85,6 +85,15 @@ You can set a `token` in your environment variable to restrict your service acce
 **Docker**: edit your environment variables in `compose.yml` and uncomment the `API_TOKEN=can_you_pass_it`\
 **Direct**: create a `.env` and put `API_TOKEN=can_you_pass_it`
 
+### Lavalink Config
+```yaml
+plugins:
+  youtube:
+    remotePot:
+      url: "http://localhost:8080",
+      pass: "can_you_pass_it" # here goes your service pass
+```
+
 ## Endpoints
 
 
