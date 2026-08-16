@@ -8,13 +8,8 @@ if (docker compose version *> $null) {
     throw "Neither 'docker compose' nor 'docker-compose' is available."
 }
 
-if ($env:WEBPO_IMAGE) {
-    Write-Host "Pulling $env:WEBPO_IMAGE"
-    Invoke-Expression "$composeCommand pull"
-} else {
-    Write-Host 'No WEBPO_IMAGE set; refreshing the local build from the Docker base image.'
-    Invoke-Expression "$composeCommand build --pull"
-}
+Write-Host "Pulling ghcr.io/your-user/webpo-generator:latest"
+Invoke-Expression "$composeCommand pull"
 
 Invoke-Expression "$composeCommand up -d --force-recreate"
 Write-Host 'Done.'
