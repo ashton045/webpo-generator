@@ -49,6 +49,9 @@ plugins:
 - **CACHE_SIZE** - max cached bindings, default is `100`
 - **VISITOR_TTL** - visistorId ttl in ms, default is `36000000`
 
+## IPv6/IPv4 bindings
+it's very simple to bind your host to either IPv4/IPv6 interface is by setting `HOST=0.0.0.0` or `HOST=::` in your environment. To access the service locally use `http://localhost:8080` or `http://[::1]:8001` or insert an actual IPv4/IPv6 to get access from another device.
+
 ## Hosting
 ### Docker Setup
 
@@ -61,7 +64,7 @@ docker compose up
 ```
 
 > [!Note]
-> To refresh a published image, set `WEBPO_IMAGE` and run `scripts/update-compose.sh` (or `scripts/update-compose.ps1` on Windows).
+> To pull the latest image and restart the stack after updates: run `scripts/update-compose.sh` (or `scripts/update-compose.ps1` on Windows).
 
 ### Direct Setup
 

@@ -1,6 +1,6 @@
 services:
   webpo:
-    image: ${WEBPO_IMAGE:-ghcr.io/ashton318/webpo-generator:latest}
+    image: ${WEBPO_IMAGE:-ghcr.io/ashton045/webpo-generator:latest}
     build:
       context: .
       dockerfile: Dockerfile
@@ -8,7 +8,6 @@ services:
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
     environment:
-      - NODE_ENV=production
       - HOST=${HOST:-::}
       - PORT=${PORT:-8080}
       - WORKERS=${WORKERS:-1}
