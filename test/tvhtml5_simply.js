@@ -20,7 +20,7 @@ console.log(d)
 
 const innertube = await Innertube.create({ client_type: client, cache: new UniversalCache(true), visitor_data: d.contentBinding });
 const info = await innertube.getBasicInfo(id, {client});
-const format = info.chooseFormat({ quality: 'best', type: 'audio', po_token: d.poToken });
+const format = info.chooseFormat({ quality: 'best', type: 'audio' });
 const u = `${await format.decipher(innertube.session.player)}&pot=${encodeURIComponent(d.poToken)}`;
 
 console.log(u);
