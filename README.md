@@ -79,7 +79,7 @@ npm start
 ```
 
 ## Auth
-You can set a `token` in your environment variable to restrict your service access upto you. 
+You can set a `token` in your environment variable to restrict your service access upto you only. 
 ```json
 {
   "Authorization": "can_you_pass_it"
@@ -178,4 +178,5 @@ content binding → botguard minter → WebPO bytes → websafe Base64 PoT
 ```
 
 The content binding is either a video id or visitor data. Real PoT results are cached according to the binding type and lifetime. Cold start tokens are optional bootstrap values for the temporary `sps=2` state.\
-:)
+
+Thanks to [Deivu](https://github.com/Deivu) helped populating the sources :)
