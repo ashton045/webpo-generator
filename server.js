@@ -158,6 +158,9 @@ async function handle(req, res) {
 
     if(path === '/health' && req.method === 'GET') return send(res, 200, { status: 'ok' });
 
+    if(!isAuthorized(req, token))
+        return send(res, 401, { error: 'unauthorized' });
+
     if(path === '/ready' && req.method === 'GET') 
         return send(res, pool.stats().workers > 0 ? 200 : 503, { status: pool.stats().workers > 0 ? 'ready' : 'unavailable', ...pool.stats() });
 
@@ -179,9 +182,6 @@ async function handle(req, res) {
         });
 
     if(path === '/decode_cold_start' && req.method === 'POST') {
-        if(!isAuthorized(req, token)) 
-            return send(res, 401, { error: 'unauthorized' });
-
         try {
             const body = await readBody(req);
             const err = validateColdStartDecode(body);
@@ -196,9 +196,6 @@ async function handle(req, res) {
     
     if(!['/generate'].includes(path) || req.method !== 'POST') 
         return send(res, 404, { error: 'not found' });
-
-    if(!isAuthorized(req, token))
-        return send(res, 401, { error: 'unauthorized' });
 
     if(metrics.pendingRequests >= maxPendingRequests)
         return send(res, 503, { error: 'service overloaded' });
