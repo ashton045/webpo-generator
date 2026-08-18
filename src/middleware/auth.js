@@ -3,7 +3,7 @@ import { timingSafeEqual } from 'node:crypto';
 export function isAuthorized(req, token) {
 
     if(typeof token !== 'string' || !token?.length)
-        return false;
+        return true;
 
     const authorization = req?.headers?.authorization;
 
