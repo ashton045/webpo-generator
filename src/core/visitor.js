@@ -53,7 +53,12 @@ async function visitor_endpoint(timeout) {
 
     const res = await fetch(VISITOR_ID_ENDPOINT, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'user-agent': USER_AGENT, 'x-youtube-client-name': WEB_CLIENT_ID, 'x-youtube-client-version': WEB_CLIENT_VERSION },
+        headers: { 
+            'content-type': 'application/json', 
+            'user-agent': USER_AGENT, 
+            'x-youtube-client-name': WEB_CLIENT_ID, 
+            'x-youtube-client-version': WEB_CLIENT_VERSION 
+        },
         signal: AbortSignal.timeout(timeout),
         body: JSON.stringify({
             context: {

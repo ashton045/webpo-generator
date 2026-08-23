@@ -7,8 +7,7 @@ import {
     USER_AGENT, 
     YT_BASE,
     WEB_CLIENT_NAME,
-    WEB_CLIENT_VERSION,
-    WEB_CLIENT_ID
+    WEB_CLIENT_VERSION
 } from './src/utils/constants.js';
 import { 
     base64ToUint8, 
@@ -27,31 +26,6 @@ function release_dom(dom) {
     }
 
     dom.window.close();
-}
-
-let innertube_api_key = INNERTUBE_API_KEY;
-let innertube_api_key_expires = 0;
-
-async function get_innertube_api_key() {
-    if(innertube_api_key_expires > Date.now())
-        return innertube_api_key;
-
-    try {
-        const res = await fetch(`${YT_BASE}/sw.js`, {
-            headers: { accept: '*/*', 'user-agent': USER_AGENT },
-            signal: AbortSignal.timeout(10000)
-        });
-        const txt = await res.text();
-        const key = txt.match(/AIza[0-9A-Za-z_-]{20,}/)?.[0];
-
-        if(key)
-            innertube_api_key = key;
-    } catch {
-        innertube_api_key = INNERTUBE_API_KEY;
-    }
-
-    innertube_api_key_expires = Date.now() + 60 * 60 * 1000;
-    return innertube_api_key;
 }
 
 function parse_waa_challenge(raw_data) {
@@ -218,7 +192,6 @@ export async function getWebPo(useYouTubeAPI = true) {
         });
 
         let key = REQUEST_KEY, challenge;
-        const api_key = await get_innertube_api_key();
 
         try {
 
@@ -272,7 +245,7 @@ export async function getWebPo(useYouTubeAPI = true) {
                 method: 'POST',
                 headers: {
                     'content-type': 'application/json+protobuf',
-                    'x-goog-api-key': api_key,
+                    'x-goog-api-key': INNERTUBE_API_KEY,
                     'x-user-agent': 'grpc-web-javascript/0.1',
                     'user-agent': USER_AGENT
                 },
@@ -285,16 +258,16 @@ export async function getWebPo(useYouTubeAPI = true) {
             challenge = parse_waa_challenge(await waa_res.json());
         }
 
-        if(!challenge?.bgChallenge) {
+       if(!challenge?.bgChallenge) {
             try {
                 const att_url = `${YT_BASE}/youtubei/v1/att/get?prettyPrint=false`;
                 const att_res = await fetch(att_url, {
                     method: 'POST',
                     headers: {
-                        accept: '*/*',
+                        'accept': '*/*',
                         'content-type': 'application/json',
                         'user-agent': USER_AGENT,
-                        'x-goog-api-key': api_key
+                        'x-goog-api-key': INNERTUBE_API_KEY
                     },
                     body: JSON.stringify({
                         context: {
@@ -319,7 +292,7 @@ export async function getWebPo(useYouTubeAPI = true) {
             } catch {
                 challenge = undefined;
             }
-        }
+        } 
         
         if(!challenge?.bgChallenge)
             throw new Error('Could not get botguard challenge');
@@ -331,7 +304,7 @@ export async function getWebPo(useYouTubeAPI = true) {
 
         if(!interpreter) throw new Error("couldn't load botguard interpreter");
 
-        //console.log(interpreter);
+        //console.log(challenge.bgChallenge);
 
         new Function(interpreter)();
 
@@ -350,15 +323,12 @@ export async function getWebPo(useYouTubeAPI = true) {
             headers: {
                 'content-type': 'application/json+protobuf',
                 'x-goog-api-key': request_key,
-                'x-user-agent': 'grpc-web-javascript/0.1',
-                'user-agent': USER_AGENT
+                'x-user-agent': 'grpc-web-javascript/0.1'
             },
             body: JSON.stringify([key, res])
         });
 
-        let t_txt = await fetch(endpoint, generate_options(api_key));
-        if(!t_txt.ok && api_key !== INNERTUBE_API_KEY)
-            t_txt = await fetch(endpoint, generate_options(INNERTUBE_API_KEY));
+        let t_txt = await fetch(endpoint, generate_options(INNERTUBE_API_KEY));
 
         if(!t_txt.ok) throw new Error(`GenerateIT returned ${t_txt.status}`);
 

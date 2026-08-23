@@ -163,7 +163,7 @@ The service can obtain a botguard challenge through 4 fallback methods. They are
 3. **innertube att** - sends a POST request to `/youtubei/v1/att/get?prettyPrint=false` with a `WEB` client ctx and receives the botguard challenge directly.
 4. **WAA Create RPC** - sends the request key to Google's WAA `Create` endpoint. The response can be encoded, so the service decodes it before reading the program, global name, and interpreter infos.
 
-The service also extracts the current innertube api key from yt's `sw.js`. The builtin key remains available as a fallback because less requesting makes yt to sus less as well :).
+The harcoded innertube key is being used in here for certain requests, as that key has been registered for google's private apis.
 
 After the challenge is fetched and then it loads the interpreter js.
 
