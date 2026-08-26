@@ -159,9 +159,9 @@ An attestation is not the final PoT btw cuz it's evidence produced by the botgua
 The service can obtain a botguard challenge through 4 fallback methods. They are ordered from highest success rates to lowest:
 
 1. **yt homepage** - The service fetches the initial/home page, extracts `ytcfg.set(...)`, installs the `ytcfg` into the virtual page, and reads the `window.ytAtN(...)` challenge.
-2. **tv config** - fetches `tv_config`, which contains challenge data directly and does not depend on the homepage event data.
-3. **innertube att** - sends a POST request to `/youtubei/v1/att/get?prettyPrint=false` with a `WEB` client ctx and receives the botguard challenge directly.
-4. **WAA Create RPC** - sends the request key to Google's WAA `Create` endpoint. The response can be encoded, so the service decodes it before reading the program, global name, and interpreter infos.
+2. **innertube att** - sends a POST request to `/youtubei/v1/att/get?prettyPrint=false` with a `WEB` client ctx and receives the botguard challenge directly.
+3. **WAA Create RPC** - sends the request key to Google's WAA `Create` endpoint. The response can be encoded, so the service decodes it before reading the program, global name, and interpreter infos.
+4. **tv config** - fetches `tv_config`, which contains challenge data directly and does not depend on the homepage event data.
 
 The harcoded innertube key is being used in here for certain requests, as that key has been registered for google's private apis.
 

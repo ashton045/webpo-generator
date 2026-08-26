@@ -29,6 +29,9 @@ function release_dom(dom) {
 }
 
 function parse_waa_challenge(raw_data) {
+    if(raw_data?.bgChallenge)
+        return raw_data;
+
     if(raw_data?.[0]?.bgChallenge)
         return raw_data[0];
 
@@ -39,6 +42,8 @@ function parse_waa_challenge(raw_data) {
         challenge_data = JSON.parse(new TextDecoder().decode(bytes.map((value) => value + 97)));
     } else if(Array.isArray(raw_data?.[0])) {
         challenge_data = raw_data[0];
+    } else if(Array.isArray(raw_data)) {
+        challenge_data = raw_data;
     }
 
     if(!Array.isArray(challenge_data))
@@ -191,7 +196,7 @@ export async function getWebPo(useYouTubeAPI = true) {
             origin: dom.window.origin 
         });
 
-        let key = REQUEST_KEY, challenge;
+        let key = REQUEST_KEY, challenge, eacrToken;
 
         try {
 
@@ -205,36 +210,121 @@ export async function getWebPo(useYouTubeAPI = true) {
             });
 
             const txt = await res.text();
-            const config = txt.match(/ytcfg\.set\(({.+?})\);/s)?.[1];
 
-            if(config) {
-                dom.window.yt = {
-                    config_: JSON.parse(config)
-                };
-                globalThis.yt = dom.window.yt;
+            dom.window.yt = dom.window.yt || { config_: {} };
+            dom.window.yt.config_ = dom.window.yt.config_ || {};
+
+            const cfg = txt.matchAll(/ytcfg\.set\(({.+?})\);/gs);
+
+            for (const match of cfg) {
+                try {
+                    Object.assign(dom.window.yt.config_, JSON.parse(match[1]));
+                } catch {
+                    try {
+                        Object.assign(dom.window.yt.config_, parse_json(match[1]));
+                    } catch { }
+                }
             }
 
-            const attestation = txt.match(/window\.ytAtN\(\s*({[\s\S]*?})\s*\)/);
-            challenge = attestation ? parse_json(attestation[1]).R : undefined;
+            const reg_match = txt.matchAll(/ytcfg\.set\(["']([A-Za-z0-9_]+)["']\s*,\s*(["'].*?["']|true|false|\d+|{[^}]+}|\[[^\]]+\])\);/gs);
+            
+            for (const match of reg_match) {
+                try {
+                    dom.window.yt.config_[match[1]] = JSON.parse(match[2]);
+                } catch {
+                    dom.window.yt.config_[match[1]] = match[2].replace(/^["']|["']$/g, '');
+                }
+            }
 
+            if (!dom.window.yt.config_.EVENT_ID) {
+                const rand_bytes = new Uint8Array(16);
+                crypto.getRandomValues(rand_bytes);
+                dom.window.yt.config_.EVENT_ID = Uint8ToBase64(rand_bytes, true).replace(/=+$/, '');
+            }
+
+            globalThis.yt = dom.window.yt;
+
+           const attestation = txt.match(/window\.ytAtN\(\s*({[\s\S]*?})\s*\)/);
+
+            if (attestation) {
+                try {
+                    const parsed = parse_json(attestation[1]);
+                    challenge = parsed.R?.bgChallenge ? parsed.R : parse_waa_challenge(parsed.R);
+                    eacrToken = parsed.T;
+                } catch {
+                    challenge = undefined;
+                }
+            }
+
+            //console.log(eacrToken)
+
+            if (!challenge?.bgChallenge && !eacrToken) {
+
+                const initialAttestationMatch = txt.match(/initialAttestationDataJson\s*=\s*({[\s\S]*?});/);
+                
+                if (initialAttestationMatch) {
+                    try {
+                        const parsed = parse_json(initialAttestationMatch[1]);
+                        challenge = parsed.R?.bgChallenge ? parsed.R : parse_waa_challenge(parsed.R);
+                        eacrToken = parsed.T || eacrToken;
+                    } catch { }
+                }
+            }
         } catch {
 
         }
 
-        if(!challenge?.bgChallenge) {
+        if (!dom.window.yt?.config_?.EVENT_ID) {
+            
+            dom.window.yt = dom.window.yt || {};
+            dom.window.yt.config_ = dom.window.yt.config_ || {};
+
+            if (!dom.window.yt.config_.EVENT_ID) {
+                const rand_bytes = new Uint8Array(16);
+                crypto.getRandomValues(rand_bytes);
+                dom.window.yt.config_.EVENT_ID = Uint8ToBase64(rand_bytes, true).replace(/=+$/, '');
+            }
+
+            globalThis.yt = dom.window.yt;
+        }
+
+        if (!challenge?.bgChallenge) {
+
             try {
 
-                const res = await fetch(TV_CONFIG, { headers: { accept: '*/*', 'user-agent': TV_USER_AGENT } });
-                const txt = await res.text();
+                const payload = {
+                    context: {
+                        client: {
+                            clientName: WEB_CLIENT_NAME,
+                            clientVersion: WEB_CLIENT_VERSION
+                        }
+                    },
+                    engagementType: 'ENGAGEMENT_TYPE_UNBOUND'
+                };
 
-                if(!txt.startsWith(')]}'))
-                    throw new Error('invalid yt tv config response');
+                if (eacrToken)
+                    payload.eacrToken = eacrToken;
 
-                const json = JSON.parse(txt.slice(4));
+                const att_res = await fetch(`${YT_BASE}/youtubei/v1/att/get?prettyPrint=false`, {
+                    method: 'POST',
+                    headers: {
+                        'accept': '*/*',
+                        'content-type': 'application/json',
+                        'user-agent': USER_AGENT,
+                        'x-goog-api-key': INNERTUBE_API_KEY
+                    },
+                    body: JSON.stringify(payload)
+                });
 
-                challenge = json.challengeParams?.R ? JSON.parse(json.challengeParams.R) : undefined;
-                key = json.challengeRequestKey || key;
+                if(!att_res.ok)
+                    throw new Error(`att/get returned ${att_res.status}`);
 
+                const attestation = await att_res.json();
+
+                if(!attestation?.bgChallenge)
+                    throw new Error('could not get challenge from att/get');
+
+                challenge = { bgChallenge: attestation.bgChallenge };
             } catch {
                 challenge = undefined;
             }
@@ -258,42 +348,26 @@ export async function getWebPo(useYouTubeAPI = true) {
             challenge = parse_waa_challenge(await waa_res.json());
         }
 
-       if(!challenge?.bgChallenge) {
-            try {
-                const att_url = `${YT_BASE}/youtubei/v1/att/get?prettyPrint=false`;
-                const att_res = await fetch(att_url, {
-                    method: 'POST',
-                    headers: {
-                        'accept': '*/*',
-                        'content-type': 'application/json',
-                        'user-agent': USER_AGENT,
-                        'x-goog-api-key': INNERTUBE_API_KEY
-                    },
-                    body: JSON.stringify({
-                        context: {
-                            client: {
-                                clientName: WEB_CLIENT_NAME,
-                                clientVersion: WEB_CLIENT_VERSION
-                            }
-                        },
-                        engagementType: 'ENGAGEMENT_TYPE_UNBOUND'
-                    })
-                });
+        if(!challenge?.bgChallenge) {
 
-                if(!att_res.ok)
-                    throw new Error(`att/get returned ${att_res.status}`);
+           try {
 
-                const attestation = await att_res.json();
+                const res = await fetch(TV_CONFIG, { headers: { accept: '*/*', 'user-agent': TV_USER_AGENT } });
+                const txt = await res.text();
 
-                if(!attestation?.bgChallenge)
-                    throw new Error('could not get challenge from att/get');
+                if(!txt.startsWith(')]}'))
+                    throw new Error('invalid yt tv config response');
 
-                challenge = { bgChallenge: attestation.bgChallenge };
+                const json = JSON.parse(txt.slice(4));
+
+                challenge = json.challengeParams?.R ? JSON.parse(json.challengeParams.R) : undefined;
+                key = json.challengeRequestKey || key;
+
             } catch {
                 challenge = undefined;
             }
-        } 
-        
+        }
+
         if(!challenge?.bgChallenge)
             throw new Error('Could not get botguard challenge');
 
@@ -323,7 +397,8 @@ export async function getWebPo(useYouTubeAPI = true) {
             headers: {
                 'content-type': 'application/json+protobuf',
                 'x-goog-api-key': request_key,
-                'x-user-agent': 'grpc-web-javascript/0.1'
+                'x-user-agent': 'grpc-web-javascript/0.1',
+                'user-agent': USER_AGENT
             },
             body: JSON.stringify([key, res])
         });
