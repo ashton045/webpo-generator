@@ -20,7 +20,7 @@ function release_dom(dom) {
     if (!dom) return;
 
     if (globalThis.window === dom.window) {
-        for (const property of ['window', 'document', 'location', 'origin', 'yt']) {
+        for (const property of ['window', 'document', 'location', 'origin', 'yt', 'navigator']) {
             try { delete globalThis[property]; } catch { globalThis[property] = undefined; }
         }
     }
@@ -119,34 +119,45 @@ export async function create_bg(options) {
     };
 }
 
-class Minter {
-    constructor(callback, client, dom) {
+export class Minter {
+    constructor(callback, client, dom, iTdata) {
         this.callback = callback;
         this.client = client;
         this.dom = dom;
+        this.integrityTokenData = iTdata;
+        this.expiresAt = iTdata?.expiresAt || 0;
+        const threshold = Number(iTdata?.mint_refresh_threshold ?? iTdata?.mintRefreshThreshold);
+        this.mintThreshold = Number.isFinite(threshold) && threshold > 0 ? threshold : 100;
+        this.mintCount = 0;
         this.active = 0;
         this.retired = false;
         this.closed = false;
+    }
+
+    isExhausted() {
+        return this.mintThreshold > 0 && this.mintCount >= this.mintThreshold;
     }
 
     static async create(integrityToken, webPoSignalOutput, client, dom) {
 
         const getMinter = webPoSignalOutput[0];
 
-        if(!getMinter || !integrityToken.integrity_token)
+        if(!getMinter || !integrityToken?.integrity_token)
             throw new Error('Could not create WebPO minter');
 
-        const callback = await getMinter(base64ToUint8(integrityToken.integrity_token));
+        const callback = await getMinter(base64ToUint8(integrityToken?.integrity_token));
 
         if(!(callback instanceof Function))
             throw new Error('WebPO minter unavailable');
 
-        return new Minter(callback, client, dom);
+        return new Minter(callback, client, dom, integrityToken);
     }
+
     retire() {
         this.retired = true;
         this.close_idles();
     }
+
     close_idles() {
         if(!this.retired || this.active > 0 || this.closed) return;
 
@@ -156,8 +167,10 @@ class Minter {
         Promise.resolve(this.client?.shutdown?.()).catch(() => { });
 
     }
+
     async mintAsWebsafeString(contentBinding) {
         this.active++;
+        this.mintCount++;
 
         try {
             return Uint8ToBase64(await this.callback(new TextEncoder().encode(contentBinding)), true);
@@ -175,7 +188,14 @@ let cur;
 
 export async function getWebPo(useYouTubeAPI = true) {
 
-    if(minter_promise && (expires === 0 || expires > Date.now()))
+    if (cur && cur.isExhausted()) {
+        cur.retire();
+        cur = undefined;
+        minter_promise = undefined;
+        expires = 0;
+    }
+
+    if(minter_promise && (expires === 0 || expires > Date.now() + 15000))
         return minter_promise;
 
     cur?.retire();
@@ -194,6 +214,12 @@ export async function getWebPo(useYouTubeAPI = true) {
             document: dom.window.document, 
             location: dom.window.location, 
             origin: dom.window.origin 
+        });
+
+        Object.defineProperty(globalThis, 'navigator', {
+            value: dom.window.navigator,
+            configurable: true,
+            writable: true
         });
 
         let key = REQUEST_KEY, challenge, eacrToken;
@@ -237,9 +263,10 @@ export async function getWebPo(useYouTubeAPI = true) {
             }
 
             if (!dom.window.yt.config_.EVENT_ID) {
-                const rand_bytes = new Uint8Array(16);
-                crypto.getRandomValues(rand_bytes);
-                dom.window.yt.config_.EVENT_ID = Uint8ToBase64(rand_bytes, true).replace(/=+$/, '');
+                const event_reg = txt.match(/"EVENT_ID"\s*:\s*"([^"]+)"/);
+                if (event_reg) {
+                    dom.window.yt.config_.EVENT_ID = event_reg[1];
+                }
             }
 
             globalThis.yt = dom.window.yt;
@@ -279,10 +306,11 @@ export async function getWebPo(useYouTubeAPI = true) {
             dom.window.yt = dom.window.yt || {};
             dom.window.yt.config_ = dom.window.yt.config_ || {};
 
-            if (!dom.window.yt.config_.EVENT_ID) {
-                const rand_bytes = new Uint8Array(16);
-                crypto.getRandomValues(rand_bytes);
-                dom.window.yt.config_.EVENT_ID = Uint8ToBase64(rand_bytes, true).replace(/=+$/, '');
+            if (!dom.window.yt.config_.EVENT_ID && typeof txt !== 'undefined') {
+                const event_reg = txt.match(/"EVENT_ID"\s*:\s*"([^"]+)"/);
+                if (event_reg) {
+                    dom.window.yt.config_.EVENT_ID = event_reg[1];
+                }
             }
 
             globalThis.yt = dom.window.yt;
@@ -407,13 +435,20 @@ export async function getWebPo(useYouTubeAPI = true) {
 
         if(!t_txt.ok) throw new Error(`GenerateIT returned ${t_txt.status}`);
 
-        const [integrity_token, estimated_ttl_secs] = await t_txt.json();
-        const minter = await Minter.create({ integrity_token }, signals, client, dom);
+        const [integrity_token, estimated_ttl_secs, mint_refresh_threshold, websafe_fallback_token] = await t_txt.json();
+        const ttl = Number(estimated_ttl_secs);
+
+        expires = Date.now() + Math.max(1, (Number.isFinite(ttl) && ttl > 0 ? ttl : 300) - 30) * 1000;
+
+        const minter = await Minter.create({ 
+            integrity_token, 
+            mint_refresh_threshold, 
+            websafe_fallback_token, 
+            expiresAt: expires 
+        }, signals, client, dom);
+        minter.expiresAt = expires;
 
         cur = minter;
-
-        const ttl = Number(estimated_ttl_secs);
-        expires = Date.now() + Math.max(1, (Number.isFinite(ttl) && ttl > 0 ? ttl : 300) - 30) * 1000;
 
         return minter;
 
@@ -430,13 +465,16 @@ export async function getWebPo(useYouTubeAPI = true) {
     }
 }
 
-export async function fetch_pot(contentBinding, useYouTubeAPI = true) {
+export async function fetch_pot(contentBinding, useYouTubeAPI = true, visitorTtl = 10 * 60 * 1000) {
 
     const minter = await getWebPo(useYouTubeAPI);
+    const isVidId = typeof contentBinding === 'string' && /^[A-Za-z0-9_-]{11}$/.test(contentBinding);
+    const tokenExpires = isVidId ? (minter.expiresAt || expires) : Math.min(minter.expiresAt || expires, Date.now() + (Number.isFinite(visitorTtl) && visitorTtl > 0 ? visitorTtl : 10 * 60 * 1000));
 
     return { 
-        poToken: await minter.mintAsWebsafeString(contentBinding), 
-        contentBinding 
+        poToken: await minter.mintAsWebsafeString(contentBinding),
+        contentBinding,
+        ttl: Math.max(0, Math.floor((tokenExpires - Date.now()) / 1000))
     };
 }
 
