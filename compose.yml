@@ -16,6 +16,6 @@ services:
       - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30000}
       - CACHE_SIZE=${CACHE_SIZE:-100}
       - CACHE_TTL=${CACHE_TTL:-300000}
-      - VISITOR_TTL=${VISITOR_TTL:-36000000}
+      - VISITOR_TTL=${VISITOR_TTL:-600000}
       - API_TOKEN=${API_TOKEN:-}
     restart: unless-stopped
