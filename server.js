@@ -10,7 +10,7 @@ import {
     metricsContentType, 
     text, 
     observe, 
-    pendingRequests as pendingRequestsGauge, 
+    pendingRequests, 
     queueDepth, 
     record_cache, 
     record, 
@@ -23,7 +23,7 @@ const workers = process.env.WORKERS || 1;
 const queueSize = process.env.QUEUE_SIZE || 32;
 const maxPendingRequests = process.env.MAX_PENDING_REQUESTS || 256;
 const cacheSize = process.env.CACHE_SIZE || 100;
-const visitorTtl = process.env.VISITOR_TTL || 6 * 60 * 60 * 1000; // 6 hours
+const visitorTtl = process.env.VISITOR_TTL || 10 * 60 * 1000; // 10 minutes
 const token = process.env.API_TOKEN || '';
 const metrics = { 
     requests: 0, 
@@ -38,13 +38,17 @@ const metrics = {
     pendingRequests: 0 
 };
 const cache = createCache(cacheSize, 150000);
-const visitor_cache = createCache(cacheSize, visitorTtl);
+const internal_visitor_cache = createCache(cacheSize, visitorTtl);
+const external_visitor_cache = createCache(cacheSize, visitorTtl);
 const inf = new Map();
 const pool = createWorkerPool({workers, queueSize, timeout: 15000, metrics});
 
 function send(res, status, body) {
 
-    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.writeHead(status, { 
+        'Content-Type': 'application/json; charset=utf-8', 
+        'Cache-Control': 'no-store' 
+    });
     res.end(JSON.stringify(body));
 }
 
@@ -53,10 +57,9 @@ function pathname(u) {
     return queryIndex === -1 ? u : u.slice(0, queryIndex);
 }
 
-function responseWithColdStartToken(result, includeColdToken) {
+function responseWithColdStartToken(result, tok) {
     const response = { ...result };
-    if(includeColdToken)
-        response.coldStartToken = createColdStartToken(result.contentBinding) || null;
+    if(tok) response.coldStartToken = createColdStartToken(result.contentBinding) || null;
     return response;
 }
 
@@ -107,43 +110,46 @@ function readBody(req) {
 }
 
 async function generate(contentBinding, explicit_binding = false) {
+    const key = typeof contentBinding === 'string' ? decodeURIComponent(contentBinding) : contentBinding;
+    const isVidId = typeof key === 'string' && /^[A-Za-z0-9_-]{11}$/.test(key);
+    const bindingCache = isVidId ? cache : (explicit_binding ? external_visitor_cache : internal_visitor_cache);
+    const k = (isVidId ? 'v:' : (explicit_binding ? 'ext:' : 'int:')) + key;
 
-    const key = contentBinding;
-    const is_video = typeof contentBinding === 'string' && /^[A-Za-z0-9_-]{11}$/.test(contentBinding);
-    const should_cache = is_video || !explicit_binding;
-    const bindingCache = is_video ? cache : visitor_cache;
-
-    const cached = should_cache ? bindingCache.get(key) : undefined;
-
-    if(cached){ 
-        metrics.cacheHits++; record_cache('hit'); 
-
+    const cached = bindingCache.get(key);
+    if (cached) { 
+        metrics.cacheHits++; 
+        record_cache('hit'); 
         return cached; 
     }
 
     metrics.cacheMisses++;
     record_cache('miss');
 
-    if(inf.has(key)) return inf.get(key);
+    if (inf.has(k)) return inf.get(k);
 
     const started = Date.now();
 
-    const promise = pool.run(contentBinding, 60000, 15000).then((value) => {
-
+    const promise = pool.run(contentBinding, visitorTtl, 15000).then((value) => {
         metrics.successes++;
         metrics.generationMs += Date.now() - started;
-
         metrics.generations++;
-
         record('success');
-        if(should_cache)
-            bindingCache.set(key, value);
+
+        if (value) {
+            let ttl = isVidId ? 150000 : visitorTtl;
+            if (value.ttl) {
+                const remainingMs = value.ttl * 1000;
+                ttl = Math.min(ttl, remainingMs);
+            }
+            if (ttl > 5000) {
+                bindingCache.set(key, value, ttl);
+            }
+        }
 
         return value;
-
-    }).finally(() => inf.delete(key));
+    }).finally(() => inf.delete(k));
     
-    inf.set(key, promise);
+    inf.set(k, promise);
 
     return promise;
 }
@@ -154,7 +160,7 @@ async function handle(req, res) {
     const path = pathname(req.url);
 
     if(path === '/' && req.method === 'GET') 
-        return send(res, 200, { name: 'webpo-generator', version: '1.0.0', endpoints: ['/generate', '/generate_pot', '/decode_cold_start', '/health', '/ready', '/metrics', '/metrics/json'] });
+        return send(res, 200, { name: 'webpo-generator', endpoints: ['/generate', '/decode_cold_start', '/health', '/ready', '/metrics', '/metrics/json'] });
 
     if(path === '/health' && req.method === 'GET') return send(res, 200, { status: 'ok' });
 
@@ -168,7 +174,10 @@ async function handle(req, res) {
 
         setStats({ ...metrics, ...pool.stats() });
 
-        res.writeHead(200, { 'Content-Type': metricsContentType, 'Cache-Control': 'no-store' });
+        res.writeHead(200, { 
+            'Content-Type': metricsContentType, 
+            'Cache-Control': 'no-store' 
+        });
         res.end(await text());
         return;
     }
@@ -176,7 +185,7 @@ async function handle(req, res) {
     if(path === '/metrics/json' && req.method === 'GET') 
         return send(res, 200, { 
             ...metrics, 
-            cacheSize: cache.size, 
+            cacheSize: cache.size + internal_visitor_cache.size + external_visitor_cache.size, 
             inFlight: inf.size, 
             ...pool.stats() 
         });
@@ -190,18 +199,18 @@ async function handle(req, res) {
 
             return send(res, 200, decodeColdStartToken(body.token));
         } catch (error) {
-            return send(res, 400, { error: error.message || 'invalid cold-start token' });
+            return send(res, 400, { error: error.message || 'invalid coldStarToken' });
         }
     }
     
-    if(!['/generate'].includes(path) || req.method !== 'POST') 
+    if(path !== '/generate' || req.method !== 'POST') 
         return send(res, 404, { error: 'not found' });
 
     if(metrics.pendingRequests >= maxPendingRequests)
         return send(res, 503, { error: 'service overloaded' });
 
     metrics.pendingRequests++;
-    pendingRequestsGauge.set(metrics.pendingRequests);
+    pendingRequests.set(metrics.pendingRequests);
 
     try {
         let body;
@@ -216,10 +225,13 @@ async function handle(req, res) {
         if(err) return send(res, 400, { error: err });
 
         try {
+            const explicit_binding = typeof body.content_binding === 'string' && body.content_binding.trim().length > 0;
+            const contentBinding = explicit_binding ? body.content_binding.trim() : await getVisitorData(visitorTtl, 30000);
 
-        const contentBinding = body.content_binding || await getVisitorData(visitorTtl, 30000);
-            return send(res, 200, responseWithColdStartToken(await generate(contentBinding, body.content_binding !== undefined), body.coldToken === true));
-
+            return send(res, 200, responseWithColdStartToken(
+                await generate(contentBinding, explicit_binding), 
+                body.coldToken === true
+            ));
         } catch (error) {
             metrics.failures++;
             record('error');
@@ -232,7 +244,7 @@ async function handle(req, res) {
     } finally {
         metrics.pendingRequests--;
 
-        pendingRequestsGauge.set(metrics.pendingRequests);
+        pendingRequests.set(metrics.pendingRequests);
 
         const stats = pool.stats();
         queueDepth.set(stats.queued ?? 0);
@@ -276,7 +288,8 @@ listen(host);
 async function shutdown(signal) { 
     console.log(`${signal}: shutting down`); 
     cache.close(); 
-    visitor_cache.close();
+    internal_visitor_cache.close();
+    external_visitor_cache.close();
     server.close(); 
     await pool.close(); process.exit(0); 
 }

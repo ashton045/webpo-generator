@@ -1,6 +1,6 @@
 # webpo-generator
 
-An http remote service to generate poTokn (proof of origin Tokken). This service mints poToken by either videoId or visitorId.
+An http remote service to generate poToken (proof of origin Token). This service mints poToken by either videoId or visitorId.
 
 ## Table of Contents
 - [Introduction](#introduction)
@@ -47,7 +47,7 @@ plugins:
 - **MAX_PENDING_REQUESTS** - max generation requests in progress, default is `256`
 - **REQUEST_TIMEOUT** - timeout in ms, default is `30000`
 - **CACHE_SIZE** - max cached bindings, default is `100`
-- **VISITOR_TTL** - visistorId ttl in ms, default is `36000000`
+- **VISITOR_TTL** - visistorId ttl in ms, default is `600000`
 
 ## IPv6/IPv4 bindings
 it's very simple to bind your host to either IPv4/IPv6 interface is by setting `HOST=0.0.0.0` or `HOST=::` in your environment. To access the service locally use `http://localhost:8080` or `http://[::1]:8001` or insert an actual IPv4/IPv6 to get access from another device.
@@ -93,7 +93,7 @@ You can set a `token` in your environment variable to restrict your service acce
 plugins:
   youtube:
     remotePot:
-      url: "http://localhost:8080",
+      url: "http://localhost:8080"
       pass: "can_you_pass_it" # here goes your service pass
 ```
 
@@ -114,7 +114,8 @@ Expect response:
 ```json
 {
   "poToken": "...",
-  "contentBinding": "..."
+  "contentBinding": "...",
+  "ttl": 599
 }
 ```
 if coldToken was set as `true`:
@@ -123,11 +124,12 @@ if coldToken was set as `true`:
 {
   "poToken": "...",
   "contentBinding": "...",
-  "coldStartToken": "..."
+  "coldStartToken": "...",
+  "ttl": 599
 }
 ```
 > [!Note]
-> `poToken` is the real content bound token. `coldStartToken` is a per response bootstrap token for yt's temporary `sps=2`.
+> `poToken` is the real content bound token. `coldStartToken` is a per response bootstrap token for yt's temporary `sps=2`. `ttl` is the remaining token validity in seconds.
 
 ### `POST /decode_cold_start`
 
@@ -158,8 +160,8 @@ An attestation is not the final PoT btw cuz it's evidence produced by the botgua
 
 The service can obtain a botguard challenge through 4 fallback methods. They are ordered from highest success rates to lowest:
 
-1. **yt homepage** - The service fetches the initial/home page, extracts `ytcfg.set(...)`, installs the `ytcfg` into the virtual page, and reads the `window.ytAtN(...)` challenge.
-2. **innertube att** - sends a POST request to `/youtubei/v1/att/get?prettyPrint=false` with a `WEB` client ctx and receives the botguard challenge directly.
+1. **yt homepage** - The service fetches the initial/home page, extracts `ytcfg.set(...)`, installs the `ytcfg` into the virtual page, and reads the `window.ytAtN(...)` challenge and `EVENT_ID`.
+2. **innertube att** - sends a POST request to `/youtubei/v1/att/get?prettyPrint=false` with a `WEB` client ctx and `eacrToken` to receives the botguard challenge directly.
 3. **WAA Create RPC** - sends the request key to Google's WAA `Create` endpoint. The response can be encoded, so the service decodes it before reading the program, global name, and interpreter infos.
 4. **tv config** - fetches `tv_config`, which contains challenge data directly and does not depend on the homepage event data.
 

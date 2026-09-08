@@ -29,16 +29,21 @@ export function createCache(max_size, ttl) {
             return entry.value;
         },
 
-        set(key, value) {
-            if (max_size <= 0 || ttl <= 0) return;
+        set(key, value, tt) {
+            const t = tt || ttl;
+            if (max_size <= 0 || t <= 0) return;
 
             remove();
 
             values.delete(key);
-            values.set(key, { value, expires: Date.now() + ttl });
+            values.set(key, { value, expires: Date.now() + t });
 
             while (values.size > max_size)
                 values.delete(values.keys().next().value);
+        },
+
+        delete(key) {
+            return values.delete(key);
         },
 
         clear() {
