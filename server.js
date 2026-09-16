@@ -23,7 +23,7 @@ const workers = process.env.WORKERS || 1;
 const queueSize = process.env.QUEUE_SIZE || 32;
 const maxPendingRequests = process.env.MAX_PENDING_REQUESTS || 256;
 const cacheSize = process.env.CACHE_SIZE || 100;
-const visitorTtl = process.env.VISITOR_TTL || 10 * 60 * 1000; // 10 minutes
+const visitorTtl = process.env.VISITOR_TTL ? Number(process.env.VISITOR_TTL) : 10 * 60 * 1000; //10mins 
 const token = process.env.API_TOKEN || '';
 const metrics = { 
     requests: 0, 
@@ -37,9 +37,13 @@ const metrics = {
     queued: 0, 
     pendingRequests: 0 
 };
-const cache = createCache(cacheSize, 150000);
+const maxCacheTtl = process.env.MAX_CACHE_TTL ? Number(process.env.MAX_CACHE_TTL) : 12 * 60 * 60 * 1000; //12hrs
+const lrTtl = process.env.LR_TTL ? Number(process.env.LR_TTL) : 60 * 60 * 1000; //1hr for lrid
+const cache = createCache(cacheSize, maxCacheTtl);
+const lr_cache = createCache(cacheSize, lrTtl);
 const internal_visitor_cache = createCache(cacheSize, visitorTtl);
-const external_visitor_cache = createCache(cacheSize, visitorTtl);
+const external_visitor_cache = createCache(cacheSize, maxCacheTtl);
+let currentMinterSession = null;
 const inf = new Map();
 const pool = createWorkerPool({workers, queueSize, timeout: 15000, metrics});
 
@@ -58,7 +62,7 @@ function pathname(u) {
 }
 
 function responseWithColdStartToken(result, tok) {
-    const response = { ...result };
+    const { minterSession, ...response } = result;
     if(tok) response.coldStartToken = createColdStartToken(result.contentBinding) || null;
     return response;
 }
@@ -109,17 +113,41 @@ function readBody(req) {
     });
 }
 
-async function generate(contentBinding, explicit_binding = false) {
+async function generate(contentBinding, explicit_binding = false, req_ttl = null) {
     const key = typeof contentBinding === 'string' ? decodeURIComponent(contentBinding) : contentBinding;
     const isVidId = typeof key === 'string' && /^[A-Za-z0-9_-]{11}$/.test(key);
-    const bindingCache = isVidId ? cache : (explicit_binding ? external_visitor_cache : internal_visitor_cache);
-    const k = (isVidId ? 'v:' : (explicit_binding ? 'ext:' : 'int:')) + key;
+    const isLrId = typeof key === 'string' && /^[A-Za-z0-9+/_-]{11}=$/.test(key);
 
-    const cached = bindingCache.get(key);
-    if (cached) { 
-        metrics.cacheHits++; 
-        record_cache('hit'); 
-        return cached; 
+    let bindingCache = null;
+    let cachePrefix = 'ext:';
+    let defaultTtlMs = 0;
+
+    if (isVidId) {
+        bindingCache = cache;
+        cachePrefix = 'v:';
+        defaultTtlMs = maxCacheTtl;
+    } else if (isLrId) {
+        bindingCache = lr_cache;
+        cachePrefix = 'lr:';
+        defaultTtlMs = lrTtl;
+    } else if (!explicit_binding) {
+        bindingCache = internal_visitor_cache;
+        cachePrefix = 'int:';
+        defaultTtlMs = visitorTtl; 
+    } else {
+        bindingCache = external_visitor_cache;
+        defaultTtlMs = maxCacheTtl;
+    }
+
+    const k = cachePrefix + key;
+
+    if (bindingCache) {
+        const cached = bindingCache.get(key);
+        if (cached) { 
+            metrics.cacheHits++; 
+            record_cache('hit'); 
+            return cached; 
+        }
     }
 
     metrics.cacheMisses++;
@@ -128,21 +156,40 @@ async function generate(contentBinding, explicit_binding = false) {
     if (inf.has(k)) return inf.get(k);
 
     const started = Date.now();
+    const taskTtl = req_ttl || (isVidId ? null : (defaultTtlMs > 0 ? defaultTtlMs : null));
 
-    const promise = pool.run(contentBinding, visitorTtl, 15000).then((value) => {
+    const promise = pool.run(contentBinding, taskTtl, 15000, taskTtl).then((value) => {
         metrics.successes++;
         metrics.generationMs += Date.now() - started;
         metrics.generations++;
         record('success');
 
         if (value) {
-            let ttl = isVidId ? 150000 : visitorTtl;
-            if (value.ttl) {
-                const remainingMs = value.ttl * 1000;
-                ttl = Math.min(ttl, remainingMs);
+            if (value.minterSession) {
+                if (currentMinterSession && value.minterSession !== currentMinterSession) {
+                    cache.clear();
+                    lr_cache.clear();
+                    external_visitor_cache.clear();
+                }
+                currentMinterSession = value.minterSession;
             }
-            if (ttl > 5000) {
-                bindingCache.set(key, value, ttl);
+
+            if (bindingCache) {
+                let ttl_ms;
+                if (isVidId || explicit_binding) {
+                    ttl_ms = req_ttl 
+                        ? (value.ttl ? Math.min(req_ttl, value.ttl * 1000) : req_ttl)
+                        : (value.ttl ? value.ttl * 1000 : maxCacheTtl);
+                } else {
+                    ttl_ms = taskTtl || defaultTtlMs;
+                    if (value.ttl) {
+                        ttl_ms = Math.min(ttl_ms, value.ttl * 1000);
+                    }
+                }
+
+                if (ttl_ms > 5000) {
+                    bindingCache.set(key, value, ttl_ms);
+                }
             }
         }
 
@@ -185,7 +232,7 @@ async function handle(req, res) {
     if(path === '/metrics/json' && req.method === 'GET') 
         return send(res, 200, { 
             ...metrics, 
-            cacheSize: cache.size + internal_visitor_cache.size + external_visitor_cache.size, 
+            cacheSize: cache.size + lr_cache.size + internal_visitor_cache.size + external_visitor_cache.size, 
             inFlight: inf.size, 
             ...pool.stats() 
         });
@@ -227,9 +274,10 @@ async function handle(req, res) {
         try {
             const explicit_binding = typeof body.content_binding === 'string' && body.content_binding.trim().length > 0;
             const contentBinding = explicit_binding ? body.content_binding.trim() : await getVisitorData(visitorTtl, 30000);
+            const req_ttl = Number.isFinite(body.ttl) && body.ttl > 0 ? body.ttl * 1000 : null;
 
             return send(res, 200, responseWithColdStartToken(
-                await generate(contentBinding, explicit_binding), 
+                await generate(contentBinding, explicit_binding, req_ttl), 
                 body.coldToken === true
             ));
         } catch (error) {
@@ -288,6 +336,7 @@ listen(host);
 async function shutdown(signal) { 
     console.log(`${signal}: shutting down`); 
     cache.close(); 
+    lr_cache.close();
     internal_visitor_cache.close();
     external_visitor_cache.close();
     server.close(); 

@@ -11,6 +11,9 @@ export function validateGeneration(body) {
     if(body.coldToken !== undefined && typeof body.coldToken !== 'boolean')
         return 'coldToken must be a boolean when provided';
 
+    if(body.ttl !== undefined && (typeof body.ttl !== 'number' || !Number.isFinite(body.ttl) || body.ttl <= 0))
+        return 'ttl must be a positive number when provided';
+
     return;
 }
 
