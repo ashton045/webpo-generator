@@ -465,16 +465,17 @@ export async function getWebPo(useYouTubeAPI = true) {
     }
 }
 
-export async function fetch_pot(contentBinding, useYouTubeAPI = true, visitorTtl = 10 * 60 * 1000) {
+export async function fetch_pot(contentBinding, useYouTubeAPI = true, ttl = null) {
 
     const minter = await getWebPo(useYouTubeAPI);
-    const isVidId = typeof contentBinding === 'string' && /^[A-Za-z0-9_-]{11}$/.test(contentBinding);
-    const tokenExpires = isVidId ? (minter.expiresAt || expires) : Math.min(minter.expiresAt || expires, Date.now() + (Number.isFinite(visitorTtl) && visitorTtl > 0 ? visitorTtl : 10 * 60 * 1000));
+    const minter_expires = minter.expiresAt || expires;
+    const token_expires = Number.isFinite(ttl) && ttl > 0 ? Math.min(minter_expires, Date.now() + ttl) : minter_expires;
 
     return { 
         poToken: await minter.mintAsWebsafeString(contentBinding),
         contentBinding,
-        ttl: Math.max(0, Math.floor((tokenExpires - Date.now()) / 1000))
+        ttl: Math.max(0, Math.floor((token_expires - Date.now()) / 1000)),
+        minterSession: minter.integrityTokenData?.integrity_token || null
     };
 }
 

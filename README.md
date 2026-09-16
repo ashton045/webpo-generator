@@ -56,7 +56,7 @@ it's very simple to bind your host to either IPv4/IPv6 interface is by setting `
 ### Docker Setup
 
 ```bash
-git clone https://github.com/ashton318/webpo-generator.git
+git clone https://github.com/ashton045/webpo-generator.git
 
 cd webpo-generator
 
@@ -69,7 +69,7 @@ docker compose up
 ### Direct Setup
 
 ```bash
-git clone https://github.com/ashton318/webpo-generator.git
+git clone https://github.com/ashton045/webpo-generator.git
 
 cd webpo-generator
 
