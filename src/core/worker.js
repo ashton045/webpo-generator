@@ -1,9 +1,9 @@
 import { parentPort } from 'node:worker_threads';
 import { generate } from './generator.js';
 
-parentPort.on('message', async ({ contentBinding, visitorTtl, requestTimeout }) => {
+parentPort.on('message', async ({ contentBinding, visitorTtl, timeout, ttl }) => {
     try {
-        parentPort.postMessage({ type: 'success', data: await generate(contentBinding, visitorTtl, requestTimeout)
+        parentPort.postMessage({ type: 'success', data: await generate(contentBinding, ttl || visitorTtl, timeout)
         });
     }
     catch (error) {

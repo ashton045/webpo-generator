@@ -95,6 +95,7 @@ export function createWorkerPool({ workers: worker_counts, queueSize, timeout, m
             i.worker.postMessage({ 
                 contentBinding: task.contentBinding, 
                 visitorTtl: task.visitorTtl, 
+                ttl: task.ttl, 
                 requestTimeout: task.requestTimeout 
             });
         }
@@ -104,7 +105,7 @@ export function createWorkerPool({ workers: worker_counts, queueSize, timeout, m
         start();
 
     return {
-        run(contentBinding, visitorTtl, requestTimeout) {
+        run(contentBinding, visitorTtl, requestTimeout, ttl) {
             if(stopped)
                 return Promise.reject(new Error('worker pool is stopped'));
 
@@ -112,7 +113,7 @@ export function createWorkerPool({ workers: worker_counts, queueSize, timeout, m
                 return Promise.reject(Object.assign(new Error('generation queue is full'), { code: 'QUEUE_FULL' }));
 
             return new Promise((resolve, reject) =>{
-                queue.push({ contentBinding, visitorTtl, requestTimeout, resolve, reject });
+                queue.push({ contentBinding, visitorTtl, requestTimeout, ttl, resolve, reject });
                 metrics.queued++;
                 dispatch();
             });
