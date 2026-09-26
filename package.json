@@ -1,24 +1,32 @@
 {
-  "name": "webpo-generator",
-  "type": "module",
-  "version": "1.0.0",
-  "description": "a remote service for generating POT by solving botguard challenges.",
-  "main": "server.js",
-  "scripts": {
-    "start": "node --env-file-if-exists=.env server.js",
-    "test": "node --test test/unit.test.js",
-    "test:syntax": "node --check server.js && node --check botguard.js && node --check src/core/workerPool.js",
-    "test:mweb": "node test/mweb.js",
-    "test:tv": "node test/tvhtml5_simply.js",
-    "test:music": "node test/web_remix.js"
-  },
-  "keywords": [],
-  "author": "https://github.com/ashton318",
-  "license": "LGPL-3.0-or-later",
-  "dependencies": {
-    "canvas": "^3.2.3",
-    "jsdom": "^29.1.1",
-    "prom-client": "^15.1.3",
-    "youtubei.js": "^18.0.0"
-  }
+    "name": "webpo-generator",
+    "type": "module",
+    "version": "1.0.0",
+    "description": "a remote service for generating POT by solving botguard challenges.",
+    "main": "server.js",
+    "scripts": {
+        "start": "node --env-file-if-exists=.env server.js",
+        "test": "node --test test/unit.test.js",
+        "test:syntax": "node --check server.js && node --check botguard.js && node --check src/core/workerPool.js",
+        "test:mweb": "node test/mweb.js",
+        "test:tv": "node test/tvhtml5_simply.js",
+        "test:music": "node test/web_remix.js",
+        "lint": "eslint .",
+        "lint:fix": "eslint . --fix",
+        "format:check": "prettier --check .",
+        "format": "prettier --write ."
+    },
+    "keywords": [],
+    "author": "https://github.com/ashton045",
+    "license": "LGPL-3.0-or-later",
+    "dependencies": {
+        "canvas": "^3.2.3",
+        "jsdom": "^29.1.1",
+        "prom-client": "^15.1.3",
+        "youtubei.js": "^18.0.0"
+    },
+    "devDependencies": {
+        "eslint": "^10.11.0",
+        "prettier": "^3.6.2"
+    }
 }

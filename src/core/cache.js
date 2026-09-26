@@ -1,5 +1,4 @@
 export function createCache(max_size, ttl) {
-
     const values = new Map();
     const cleanupTimer = setInterval(remove, Math.min(Math.max(ttl, 1000), 60000));
 
@@ -8,16 +7,13 @@ export function createCache(max_size, ttl) {
     function remove() {
         const now = Date.now();
 
-        for(const [k, entry] of values) {
-            if (entry.expires <= now)
-                values.delete(k);
+        for (const [k, entry] of values) {
+            if (entry.expires <= now) values.delete(k);
         }
     }
 
     return {
-
         get(key) {
-
             remove();
 
             const entry = values.get(key);
@@ -38,8 +34,7 @@ export function createCache(max_size, ttl) {
             values.delete(key);
             values.set(key, { value, expires: Date.now() + t });
 
-            while (values.size > max_size)
-                values.delete(values.keys().next().value);
+            while (values.size > max_size) values.delete(values.keys().next().value);
         },
 
         delete(key) {
@@ -58,5 +53,5 @@ export function createCache(max_size, ttl) {
             remove();
             return values.size;
         }
-    }
+    };
 }

@@ -6,7 +6,10 @@ import { parse_json } from '../src/utils/helpers.js';
 test('generation validation accepts an optional binding', () => {
     assert.equal(validateGeneration({}), undefined);
     assert.equal(validateGeneration({ content_binding: 'video-id' }), undefined);
-    assert.equal(validateGeneration({ content_binding: 42 }), 'content_binding must be a non-empty string when provided');
+    assert.equal(
+        validateGeneration({ content_binding: 42 }),
+        'content_binding must be a non-empty string when provided'
+    );
 });
 
 test('cold-start decode validation requires a token', () => {
@@ -33,7 +36,7 @@ test('supports arrays and unquoted keys', () => {
     const input = '{ unquoted: ["\\x31", "\\x32"], "name": "test", }';
     const parsed = parse_json(input);
     assert.deepEqual(parsed, {
-        unquoted: ["1", "2"],
+        unquoted: ['1', '2'],
         name: 'test'
     });
 });

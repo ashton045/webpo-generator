@@ -1,4 +1,3 @@
-
 import { BASE64_MAP, GOOGLE_API_BASE, REG_FOR_BASE64, YT_BASE } from './constants.js';
 
 export function base64ToUint8(base64) {
@@ -16,11 +15,12 @@ export function buildURL(endpoint, use_api = true) {
 }
 
 export function parse_json(looseJson) {
-    let jsonStr = looseJson.replace(/,\s*([\]}])/g, '$1')
-    .replace(/\\x([0-9A-Fa-f]{2})/g, '\\u00$1')
-    .replace(/'((?:[^'\\]|\\[\s\S])*)'/g, (_match, innerStr) => {
-        return `"${innerStr.replace(/\\'/g, "'").replace(/"/g, '\\"')}"`;
-    });
+    let jsonStr = looseJson
+        .replace(/,\s*([\]}])/g, '$1')
+        .replace(/\\x([0-9A-Fa-f]{2})/g, '\\u00$1')
+        .replace(/'((?:[^'\\]|\\[\s\S])*)'/g, (_match, innerStr) => {
+            return `"${innerStr.replace(/\\'/g, "'").replace(/"/g, '\\"')}"`;
+        });
 
     let parsedData;
     try {

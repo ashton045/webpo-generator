@@ -80,7 +80,7 @@ export function record_cache(result) {
 
 export function setStats(stats) {
     pendingRequests.set(stats.pendingRequests ?? 0);
-    queueDepth.set(stats.queue ?? stats.queued ?? 0);
+    queueDepth.set(stats.queue ?? 0);
     activeWorkers.set(stats.workers ?? 0);
 }
 
