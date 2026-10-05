@@ -39,6 +39,10 @@ plugins:
       url: "http://localhost:8080"
 ```
 
+## Public instance
+Use `https://pot.ashtongg.me` it's the public hosted server of webpo-generator. It has a ratelimit of `10 requests/sec`. 
+I cannot give you the guarantee of full uptime but i'll do my best to keep it up at scale.
+
 ## Configuration
 - **HOST** - listen address; falls back to IPv4 when needed.
 - **PORT** - http port, default is `8080`
