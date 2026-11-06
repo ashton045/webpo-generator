@@ -42,7 +42,6 @@ const lrTtl = process.env.LR_TTL ? Number(process.env.LR_TTL) : 60 * 60 * 1000; 
 const cache = createCache(cacheSize, maxCacheTtl);
 const lr_cache = createCache(cacheSize, lrTtl);
 const internal_visitor_cache = createCache(cacheSize, visitorTtl);
-const external_visitor_cache = createCache(cacheSize, maxCacheTtl);
 let currentMinterSession = null;
 const inf = new Map();
 const pool = createWorkerPool({ workers, queueSize, timeout: 15000, metrics });
@@ -131,9 +130,6 @@ async function generate(contentBinding, explicit_binding = false, req_ttl = null
         bindingCache = internal_visitor_cache;
         cachePrefix = 'int:';
         defaultTtlMs = visitorTtl;
-    } else {
-        bindingCache = external_visitor_cache;
-        defaultTtlMs = maxCacheTtl;
     }
 
     const k = cachePrefix + key;
@@ -168,14 +164,14 @@ async function generate(contentBinding, explicit_binding = false, req_ttl = null
                     if (currentMinterSession && value.minterSession !== currentMinterSession) {
                         cache.clear();
                         lr_cache.clear();
-                        external_visitor_cache.clear();
+                        internal_visitor_cache.clear();
                     }
                     currentMinterSession = value.minterSession;
                 }
 
                 if (bindingCache) {
                     let ttl_ms;
-                    if (isVidId || explicit_binding) {
+                    if (isVidId) {
                         ttl_ms = req_ttl
                             ? value.ttl
                                 ? Math.min(req_ttl, value.ttl * 1000)
@@ -183,6 +179,14 @@ async function generate(contentBinding, explicit_binding = false, req_ttl = null
                             : value.ttl
                               ? value.ttl * 1000
                               : maxCacheTtl;
+                    } else if (isLrId) {
+                        ttl_ms = req_ttl
+                            ? value.ttl
+                                ? Math.min(req_ttl, value.ttl * 1000)
+                                : req_ttl
+                            : value.ttl
+                              ? Math.min(lrTtl, value.ttl * 1000)
+                              : lrTtl;
                     } else {
                         ttl_ms = taskTtl || defaultTtlMs;
                         if (value.ttl) {
@@ -240,7 +244,7 @@ async function handle(req, res) {
     if (path === '/metrics/json' && req.method === 'GET')
         return send(res, 200, {
             ...metrics,
-            cacheSize: cache.size + lr_cache.size + internal_visitor_cache.size + external_visitor_cache.size,
+            cacheSize: cache.size + lr_cache.size + internal_visitor_cache.size,
             inFlight: inf.size,
             ...pool.stats()
         });
@@ -356,7 +360,6 @@ async function shutdown(signal) {
     cache.close();
     lr_cache.close();
     internal_visitor_cache.close();
-    external_visitor_cache.close();
     server.close();
     await pool.close();
     process.exit(0);
