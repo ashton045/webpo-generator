@@ -6,7 +6,7 @@
     "main": "server.js",
     "scripts": {
         "start": "node --env-file-if-exists=.env server.js",
-        "test": "node --test test/unit.test.js",
+        "test": "node --test test/unit.test.js test/minter.test.js",
         "test:syntax": "node --check server.js && node --check botguard.js && node --check src/core/workerPool.js",
         "test:mweb": "node test/mweb.js",
         "test:tv": "node test/tvhtml5_simply.js",
