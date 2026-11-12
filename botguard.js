@@ -147,6 +147,7 @@ export class Minter {
         const threshold = Number(iTdata?.mint_refresh_threshold ?? iTdata?.mintRefreshThreshold);
         this.mintThreshold = Number.isFinite(threshold) && threshold > 0 ? threshold : 100;
         this.mintCount = 0;
+        this.bornAt = Date.now();
         this.active = 0;
         this.retired = false;
         this.closed = false;
@@ -187,7 +188,9 @@ export class Minter {
         this.mintCount++;
 
         try {
-            return Uint8ToBase64(await this.callback(new TextEncoder().encode(contentBinding)), true);
+            const bytes = await this.callback(new TextEncoder().encode(contentBinding));
+            if (!bytes?.length) throw new Error('mint returned empty token');
+            return Uint8ToBase64(bytes, true);
         } finally {
             this.active--;
             this.close_idles();
@@ -235,6 +238,9 @@ export async function getWebPo(useYouTubeAPI = true) {
             configurable: true,
             writable: true
         });
+
+        // jsdom ignores the userAgent option; make the VM's UA match the request UA
+        Object.defineProperty(dom.window.navigator, 'userAgent', { value: USER_AGENT, configurable: true });
 
         let key = REQUEST_KEY,
             challenge,
@@ -446,6 +452,10 @@ export async function getWebPo(useYouTubeAPI = true) {
 
         cur = minter;
 
+        console.log(
+            `[minter] session built ttl=${Math.round((expires - Date.now()) / 1000)}s threshold=${minter.mintThreshold} sess=${(integrity_token || '').slice(0, 8)}`
+        );
+
         return minter;
     })();
     try {
@@ -458,13 +468,37 @@ export async function getWebPo(useYouTubeAPI = true) {
     }
 }
 
+function reset_minter(reason) {
+    const age = cur ? Math.round((Date.now() - cur.bornAt) / 1000) : 0;
+    console.error(`[minter] reset reason=${reason} mints=${cur?.mintCount ?? 0} age=${age}s`);
+
+    cur?.retire();
+    cur = undefined;
+    minter_promise = undefined;
+    expires = 0;
+}
+
 export async function fetch_pot(contentBinding, useYouTubeAPI = true, ttl = null) {
     const minter = await getWebPo(useYouTubeAPI);
     const minter_expires = minter.expiresAt || expires;
     const token_expires = Number.isFinite(ttl) && ttl > 0 ? Math.min(minter_expires, Date.now() + ttl) : minter_expires;
 
+    let poToken;
+    try {
+        poToken = await minter.mintAsWebsafeString(contentBinding);
+    } catch (error) {
+        // a broken session would otherwise be reused until its ttl
+        reset_minter(error.message);
+        throw error;
+    }
+
+    if (poToken.length < 20) {
+        reset_minter(`short token (${poToken.length}b)`);
+        throw new Error('mint returned short token');
+    }
+
     return {
-        poToken: await minter.mintAsWebsafeString(contentBinding),
+        poToken,
         contentBinding,
         ttl: Math.max(0, Math.floor((token_expires - Date.now()) / 1000)),
         minterSession: minter.integrityTokenData?.integrity_token || null

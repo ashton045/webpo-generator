@@ -134,11 +134,16 @@ async function generate(contentBinding, explicit_binding = false, req_ttl = null
 
     const k = cachePrefix + key;
 
+    const shown = typeof key === 'string' && key.length > 24 ? `${key.slice(0, 12)}…len${key.length}` : key;
+
     if (bindingCache) {
         const cached = bindingCache.get(key);
         if (cached) {
             metrics.cacheHits++;
             record_cache('hit');
+            console.log(
+                `[pot] ${shown} hit tok=${(cached.poToken || '').slice(0, 12)} ttl=${cached.ttl}s sess=${(cached.minterSession || '').slice(0, 8)}`
+            );
             return cached;
         }
     }
@@ -158,6 +163,10 @@ async function generate(contentBinding, explicit_binding = false, req_ttl = null
             metrics.generationMs += Date.now() - started;
             metrics.generations++;
             record('success');
+
+            console.log(
+                `[pot] ${shown} miss tok=${(value?.poToken || '').slice(0, 12)} ttl=${value?.ttl}s ms=${Date.now() - started} sess=${(value?.minterSession || '').slice(0, 8)}`
+            );
 
             if (value) {
                 if (value.minterSession) {
@@ -281,11 +290,10 @@ async function handle(req, res) {
 
         if (err) return send(res, 400, { error: err });
 
+        let contentBinding;
         try {
             const explicit_binding = typeof body.content_binding === 'string' && body.content_binding.trim().length > 0;
-            const contentBinding = explicit_binding
-                ? body.content_binding.trim()
-                : await getVisitorData(visitorTtl, 30000);
+            contentBinding = explicit_binding ? body.content_binding.trim() : await getVisitorData(visitorTtl, 30000);
             const req_ttl = Number.isFinite(body.ttl) && body.ttl > 0 ? body.ttl * 1000 : null;
 
             return send(
@@ -299,7 +307,9 @@ async function handle(req, res) {
         } catch (error) {
             metrics.failures++;
             record('error');
-            console.error(`WebPO generation failed: ${error.message}`);
+            console.error(
+                `WebPO generation failed for binding "${contentBinding}": ${error.message} code=${error.code ?? 'ERR'}`
+            );
 
             const status = error.code === 'QUEUE_FULL' ? 503 : error.code === 'TIMEOUT' ? 504 : 500;
 
