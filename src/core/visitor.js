@@ -10,6 +10,7 @@ import {
 let visitorData;
 let visitor_expires = 0;
 let reqs;
+let generation = 0;
 
 function extract(value) {
     if (!value || typeof value !== 'object') return;
@@ -84,7 +85,8 @@ export function getVisitorData(ttl = 10 * 60 * 1000, timeout = 30000) {
 
     if (reqs) return reqs;
 
-    reqs = (async () => {
+    const epoch = generation;
+    const currentReq = (async () => {
         try {
             return await fetch_initial_page(timeout);
         } catch (e) {
@@ -96,13 +98,25 @@ export function getVisitorData(ttl = 10 * 60 * 1000, timeout = 30000) {
         }
     })()
         .then((v) => {
-            visitorData = v;
-            visitor_expires = Date.now() + ttl;
+            if (epoch === generation) {
+                visitorData = v;
+                visitor_expires = Date.now() + ttl;
+            }
             return v;
         })
         .finally(() => {
-            reqs = undefined;
+            if (reqs === currentReq) {
+                reqs = undefined;
+            }
         });
 
-    return reqs;
+    reqs = currentReq;
+    return currentReq;
+}
+
+export function resetVisitorData() {
+    generation++;
+    visitorData = undefined;
+    visitor_expires = 0;
+    reqs = undefined;
 }

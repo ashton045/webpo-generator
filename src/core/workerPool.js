@@ -3,16 +3,23 @@ import { fileURLToPath } from 'node:url';
 
 const file = fileURLToPath(new URL('./worker.js', import.meta.url));
 
-export function createWorkerPool({ workers: worker_counts, queueSize, timeout, metrics }) {
+export function createWorkerPool({
+    workers: worker_counts,
+    queueSize,
+    timeout,
+    metrics,
+    workerFactory = () => new Worker(file)
+}) {
     const workers = [];
     const queue = [];
     let stopped = false;
 
     function start() {
         const item = {
-            worker: new Worker(file),
+            worker: workerFactory(),
             busy: false,
-            task: undefined
+            task: undefined,
+            minterSession: null
         };
 
         item.worker.on('message', (msg) => {
@@ -25,13 +32,18 @@ export function createWorkerPool({ workers: worker_counts, queueSize, timeout, m
 
             clearTimeout(task.timer);
 
-            if (msg.type === 'success') task.resolve(msg.data);
-            else
+            if (msg.type === 'success') {
+                if (msg.data?.minterSession) {
+                    item.minterSession = msg.data.minterSession;
+                }
+                task.resolve(msg.data);
+            } else {
                 task.reject(
                     Object.assign(new Error(msg.error?.message || 'generation failed'), {
                         code: 'GENERATION_FAILED'
                     })
                 );
+            }
 
             dispatch();
         });
@@ -119,6 +131,17 @@ export function createWorkerPool({ workers: worker_counts, queueSize, timeout, m
                 active: workers.filter((item) => item.busy).length,
                 queue: queue.length
             };
+        },
+        invalidate(minterSession = null) {
+            for (const item of workers) {
+                if (minterSession && item.minterSession !== minterSession) {
+                    continue;
+                }
+                item.minterSession = null;
+                try {
+                    item.worker.postMessage({ type: 'invalidate', minterSession });
+                } catch {}
+            }
         },
         async close() {
             stopped = true;

@@ -10,6 +10,6 @@ export const BASE64_MAP = { '-': '+', _: '/', '.': '=' };
 export const VISITOR_ID_ENDPOINT = `${YT_BASE}/youtubei/v1/visitor_id`;
 export const WEB_CLIENT_NAME = 'WEB';
 export const WEB_CLIENT_ID = '1';
-export const WEB_CLIENT_VERSION = '2.20260227.01.00';
+export const WEB_CLIENT_VERSION = '2.20260817.01.00';
 export const REQUEST_KEY = 'O43z0dpjhgX20SCx4KAo';
 export const COLD_START_MAX_BINDING_BYTES = 247;
