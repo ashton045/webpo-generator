@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { createWorkerPool } from './src/core/workerPool.js';
 import { createCache } from './src/core/cache.js';
-import { getVisitorData } from './src/core/visitor.js';
+import { getVisitorData, resetVisitorData } from './src/core/visitor.js';
 import { createColdStartToken, decodeColdStartToken } from './botguard.js';
 import { isAuthorized } from './src/middleware/auth.js';
 import { validateColdStartDecode, validateGeneration } from './src/middleware/validation.js';
@@ -37,12 +37,14 @@ const metrics = {
     queued: 0,
     pendingRequests: 0
 };
-const maxCacheTtl = process.env.MAX_CACHE_TTL ? Number(process.env.MAX_CACHE_TTL) : 12 * 60 * 60 * 1000; //12hrs
+const maxCacheTtl = process.env.MAX_CACHE_TTL ? Number(process.env.MAX_CACHE_TTL) : 6 * 60 * 60 * 1000; //6hrs
 const lrTtl = process.env.LR_TTL ? Number(process.env.LR_TTL) : 60 * 60 * 1000; //1hr for lrid
 const cache = createCache(cacheSize, maxCacheTtl);
 const lr_cache = createCache(cacheSize, lrTtl);
 const internal_visitor_cache = createCache(cacheSize, visitorTtl);
-let currentMinterSession = null;
+const maxRecentTokens = Math.max(cacheSize * 2, 500);
+const recent_tokens = new Map();
+let current_minter_session = null;
 const inf = new Map();
 const pool = createWorkerPool({ workers, queueSize, timeout: 15000, metrics });
 
@@ -161,12 +163,20 @@ async function generate(contentBinding, explicit_binding = false, req_ttl = null
 
             if (value) {
                 if (value.minterSession) {
-                    if (currentMinterSession && value.minterSession !== currentMinterSession) {
-                        cache.clear();
-                        lr_cache.clear();
-                        internal_visitor_cache.clear();
+                    current_minter_session = value.minterSession;
+                }
+
+                if (value.poToken) {
+                    recent_tokens.delete(value.poToken);
+                    recent_tokens.set(value.poToken, {
+                        key,
+                        cache: bindingCache,
+                        minterSession: value.minterSession || null,
+                        isInternal: !isVidId && !isLrId && !explicit_binding
+                    });
+                    while (recent_tokens.size > maxRecentTokens) {
+                        recent_tokens.delete(recent_tokens.keys().next().value);
                     }
-                    currentMinterSession = value.minterSession;
                 }
 
                 if (bindingCache) {
@@ -177,16 +187,16 @@ async function generate(contentBinding, explicit_binding = false, req_ttl = null
                                 ? Math.min(req_ttl, value.ttl * 1000)
                                 : req_ttl
                             : value.ttl
-                              ? value.ttl * 1000
-                              : maxCacheTtl;
+                                ? value.ttl * 1000
+                                : maxCacheTtl;
                     } else if (isLrId) {
                         ttl_ms = req_ttl
                             ? value.ttl
                                 ? Math.min(req_ttl, value.ttl * 1000)
                                 : req_ttl
                             : value.ttl
-                              ? Math.min(lrTtl, value.ttl * 1000)
-                              : lrTtl;
+                                ? Math.min(lrTtl, value.ttl * 1000)
+                                : lrTtl;
                     } else {
                         ttl_ms = taskTtl || defaultTtlMs;
                         if (value.ttl) {
@@ -217,12 +227,129 @@ async function handle(req, res) {
     if (path === '/' && req.method === 'GET')
         return send(res, 200, {
             name: 'webpo-generator',
-            endpoints: ['/generate', '/decode_cold_start', '/health', '/ready', '/metrics', '/metrics/json']
+            endpoints: [
+                '/generate',
+                '/invalidate',
+                '/minter_cache',
+                '/decode_cold_start',
+                '/health',
+                '/ready',
+                '/metrics',
+                '/metrics/json'
+            ]
         });
 
     if (path === '/health' && req.method === 'GET') return send(res, 200, { status: 'ok' });
 
     if (!isAuthorized(req, token)) return send(res, 401, { error: 'unauthorized' });
+
+    if (path === '/invalidate' && req.method === 'POST') {
+        let body = {};
+        try {
+            body = await readBody(req);
+        } catch (error) {
+            return send(res, error.code === 'BODY_TOO_LARGE' ? 413 : 400, { error: error.message });
+        }
+
+        const poToken =
+            typeof body.po_token === 'string'
+                ? body.po_token.trim()
+                : typeof body.poToken === 'string'
+                    ? body.poToken.trim()
+                    : '';
+        const raw_binding =
+            typeof body.content_binding === 'string'
+                ? body.content_binding.trim()
+                : typeof body.contentBinding === 'string'
+                    ? body.contentBinding.trim()
+                    : '';
+
+        if (!poToken && !raw_binding) {
+            inf.clear();
+            cache.clear();
+            lr_cache.clear();
+            internal_visitor_cache.clear();
+            recent_tokens.clear();
+            current_minter_session = null;
+            resetVisitorData();
+            pool.invalidate();
+
+            return send(res, 200, {
+                success: true,
+                message: 'all caches, visitor data, and minter sessions invalidated'
+            });
+        }
+
+        let bad_session = null;
+        let should_reset_visitor = false;
+        let target_key = null;
+
+        if (raw_binding) {
+            try {
+                target_key = decodeURIComponent(raw_binding);
+            } catch {
+                target_key = raw_binding;
+            }
+        }
+
+        if (poToken) {
+            const meta = recent_tokens.get(poToken);
+            if (meta) {
+                recent_tokens.delete(poToken);
+                if (!target_key) target_key = meta.key;
+                if (meta.minterSession) bad_session = meta.minterSession;
+                if (meta.isInternal) should_reset_visitor = true;
+                if (meta.cache && meta.cache.get(meta.key)?.poToken === poToken) {
+                    meta.cache.delete(meta.key);
+                }
+            }
+        }
+
+        if (target_key) {
+            for (const prefix of ['v:', 'lr:', 'int:', 'ext:']) {
+                inf.delete(prefix + target_key);
+            }
+            for (const [entry_cache, entry_internal] of [
+                [cache, false],
+                [lr_cache, false],
+                [internal_visitor_cache, true]
+            ]) {
+                const cached = entry_cache.get(target_key);
+                if (cached && (!poToken || cached.poToken === poToken)) {
+                    if (!bad_session && cached.minterSession) {
+                        bad_session = cached.minterSession;
+                    }
+                    if (entry_internal) should_reset_visitor = true;
+                    entry_cache.delete(target_key);
+                }
+            }
+        }
+
+        if (should_reset_visitor) {
+            resetVisitorData();
+        }
+
+        if (bad_session) {
+            if (current_minter_session === bad_session) {
+                current_minter_session = null;
+            }
+            pool.invalidate(bad_session);
+        }
+
+        return send(res, 200, {
+            success: true,
+            targeted: true,
+            invalidatedSession: Boolean(bad_session),
+            message: 'target token invalidated'
+        });
+    }
+
+    if (path === '/minter_cache' && req.method === 'GET') {
+        return send(res, 200, {
+            current_minter_session: current_minter_session || null,
+            workers: pool.stats().workers
+        });
+    }
 
     if (path === '/ready' && req.method === 'GET')
         return send(res, pool.stats().workers > 0 ? 200 : 503, {
@@ -308,8 +435,8 @@ async function handle(req, res) {
                     status === 503
                         ? 'service overloaded'
                         : status === 504
-                          ? 'generation timed out'
-                          : 'generation failed'
+                            ? 'generation timed out'
+                            : 'generation failed'
             });
         }
     } finally {

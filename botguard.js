@@ -1,3 +1,4 @@
+import https from 'node:https';
 import { JSDOM } from 'jsdom';
 import {
     COLD_START_MAX_BINDING_BYTES,
@@ -12,7 +13,34 @@ import {
 } from './src/utils/constants.js';
 import { base64ToUint8, buildURL, parse_json, Uint8ToBase64 } from './src/utils/helpers.js';
 
-function release_dom(dom) {
+function fetchTextHttps(urlStr, headers = {}, maxHeaderSize = 65536, timeoutMs = 15000) {
+    return new Promise((resolve, reject) => {
+        const req = https.request(urlStr, { method: 'GET', headers, maxHeaderSize, timeout: timeoutMs }, (res) => {
+            const chunks = [];
+            res.on('data', (chunk) => chunks.push(chunk));
+            res.on('end', () => {
+                resolve({
+                    ok: res.statusCode >= 200 && res.statusCode < 300,
+                    status: res.statusCode,
+                    text: Buffer.concat(chunks).toString('utf8')
+                });
+            });
+        });
+        req.on('timeout', () => req.destroy(new Error(`HTTPS request timed out: ${urlStr}`)));
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+export function release_dom(dom, globalName, vmRef) {
+    if (globalName && (vmRef === undefined || globalThis[globalName] === vmRef)) {
+        try {
+            delete globalThis[globalName];
+        } catch {
+            globalThis[globalName] = undefined;
+        }
+    }
+
     if (!dom) return;
 
     if (globalThis.window === dom.window) {
@@ -25,7 +53,19 @@ function release_dom(dom) {
         }
     }
 
-    dom.window.close();
+    try {
+        dom.window.close();
+    } catch {}
+}
+
+function disposeRuntime(dom, client, globalName, vmRef) {
+    if (client?.shutdown) {
+        return Promise.resolve(client.shutdown())
+            .catch(() => {})
+            .finally(() => release_dom(dom, globalName, vmRef));
+    }
+    release_dom(dom, globalName, vmRef);
+    return Promise.resolve();
 }
 
 function parse_waa_challenge(raw_data) {
@@ -138,11 +178,13 @@ export async function create_bg(options) {
 }
 
 export class Minter {
-    constructor(callback, client, dom, iTdata) {
+    constructor(callback, client, dom, iTdata, globalName, vmRef) {
         this.callback = callback;
         this.client = client;
         this.dom = dom;
         this.integrityTokenData = iTdata;
+        this.globalName = globalName;
+        this.vmRef = vmRef;
         this.expiresAt = iTdata?.expiresAt || 0;
         const threshold = Number(iTdata?.mint_refresh_threshold ?? iTdata?.mintRefreshThreshold);
         this.mintThreshold = Number.isFinite(threshold) && threshold > 0 ? threshold : 100;
@@ -156,7 +198,7 @@ export class Minter {
         return this.mintThreshold > 0 && this.mintCount >= this.mintThreshold;
     }
 
-    static async create(integrityToken, webPoSignalOutput, client, dom) {
+    static async create(integrityToken, webPoSignalOutput, client, dom, globalName, vmRef) {
         const getMinter = webPoSignalOutput[0];
 
         if (!getMinter || !integrityToken?.integrity_token) throw new Error('Could not create WebPO minter');
@@ -165,7 +207,7 @@ export class Minter {
 
         if (!(callback instanceof Function)) throw new Error('WebPO minter unavailable');
 
-        return new Minter(callback, client, dom, integrityToken);
+        return new Minter(callback, client, dom, integrityToken, globalName, vmRef);
     }
 
     retire() {
@@ -177,9 +219,7 @@ export class Minter {
         if (!this.retired || this.active > 0 || this.closed) return;
 
         this.closed = true;
-        release_dom(this.dom);
-
-        Promise.resolve(this.client?.shutdown?.()).catch(() => {});
+        disposeRuntime(this.dom, this.client, this.globalName, this.vmRef);
     }
 
     async mintAsWebsafeString(contentBinding) {
@@ -187,7 +227,15 @@ export class Minter {
         this.mintCount++;
 
         try {
-            return Uint8ToBase64(await this.callback(new TextEncoder().encode(contentBinding)), true);
+            const raw = await this.callback(new TextEncoder().encode(contentBinding));
+            if (!raw || raw.length === 0) {
+                throw new Error('Minter returned empty token bytes');
+            }
+            const poToken = Uint8ToBase64(raw, true);
+            if (!poToken || poToken.length < 20) {
+                throw new Error('Generated poToken is unexpectedly short');
+            }
+            return poToken;
         } finally {
             this.active--;
             this.close_idles();
@@ -198,31 +246,250 @@ export class Minter {
 let minter_promise;
 let expires = 0;
 let cur;
+let cur_source;
+let promise_allows_fallback = false;
+let minter_generation = 0;
 
-export async function getWebPo(useYouTubeAPI = true) {
-    if (cur && cur.isExhausted()) {
-        cur.retire();
-        cur = undefined;
-        minter_promise = undefined;
-        expires = 0;
+export function isVideoIdBinding(binding) {
+    if (typeof binding !== 'string') return false;
+    let key = binding.trim();
+    if (!key) return false;
+    try {
+        key = decodeURIComponent(key);
+    } catch {}
+    return /^[A-Za-z0-9_-]{11}$/.test(key);
+}
+
+function canSourceServeRequest(source, allow_fallback) {
+    if (source === 'homepage' || source === 'att_eacr') return true;
+    if (allow_fallback) return true;
+    if (source === 'att_unbound') return process.env.ALLOW_UNBOUND_ATT_FALLBACK === 'true';
+    if (source === 'waa_create') return process.env.ALLOW_WAA_CREATE_FALLBACK === 'true';
+    if (source === 'tv_config') return process.env.ALLOW_TV_CONFIG_FALLBACK === 'true';
+    return false;
+}
+
+export function resetMinter(sessionToken = null) {
+    if (sessionToken && cur?.integrityTokenData?.integrity_token !== sessionToken) {
+        return false;
     }
-
-    if (minter_promise && (expires === 0 || expires > Date.now() + 15000)) return minter_promise;
-
+    minter_generation++;
     cur?.retire();
     cur = undefined;
+    cur_source = undefined;
     minter_promise = undefined;
+    promise_allows_fallback = false;
+    expires = 0;
+    return true;
+}
+
+function applyYtConfigFromHtml(dom, txt) {
+    dom.window.yt = { config_: {} };
+
+    for (const match of txt.matchAll(/ytcfg\.set\(({.+?})\);/gs)) {
+        try {
+            Object.assign(dom.window.yt.config_, JSON.parse(match[1]));
+        } catch {
+            try {
+                Object.assign(dom.window.yt.config_, parse_json(match[1]));
+            } catch {}
+        }
+    }
+
+    const reg_match = txt.matchAll(
+        /ytcfg\.set\(["']([A-Za-z0-9_]+)["']\s*,\s*(["'].*?["']|true|false|\d+|{[^}]+}|\[[^\]]+\])\);/gs
+    );
+
+    for (const match of reg_match) {
+        try {
+            dom.window.yt.config_[match[1]] = JSON.parse(match[2]);
+        } catch {
+            dom.window.yt.config_[match[1]] = match[2].replace(/^["']|["']$/g, '');
+        }
+    }
+
+    if (!dom.window.yt.config_.EVENT_ID) {
+        const event_reg = txt.match(/"EVENT_ID"\s*:\s*"([^"]+)"/);
+        if (event_reg) {
+            dom.window.yt.config_.EVENT_ID = event_reg[1];
+        }
+    }
+
+    globalThis.yt = dom.window.yt;
+}
+
+function parseAttestationPayload(raw) {
+    let parsed = raw;
+    if (typeof raw === 'string') {
+        try {
+            parsed = JSON.parse(raw);
+        } catch {
+            parsed = parse_json(raw);
+        }
+    }
+    if (!parsed) return {};
+    return {
+        challenge: parsed.R?.bgChallenge ? parsed.R : parse_waa_challenge(parsed.R),
+        eacrToken: parsed.T
+    };
+}
+
+function extractBalancedObject(txt, start_index) {
+    if (start_index < 0 || txt[start_index] !== '{') return null;
+    let depth = 0;
+    let quote = null;
+    for (let i = start_index; i < txt.length; i++) {
+        const ch = txt[i];
+        if (quote) {
+            if (ch === '\\') {
+                i++;
+            } else if (ch === quote) {
+                quote = null;
+            }
+            continue;
+        }
+        if (ch === '"' || ch === "'") {
+            quote = ch;
+        } else if (ch === '{') {
+            depth++;
+        } else if (ch === '}') {
+            depth--;
+            if (depth === 0) {
+                return txt.slice(start_index, i + 1);
+            }
+        }
+    }
+    return null;
+}
+
+function extractHomepageAttestation(txt) {
+    const yt_AtN_start = txt.match(/window\.ytAtN\(\s*(?=\{)/);
+    if (yt_AtN_start) {
+        const rawObj = extractBalancedObject(txt, yt_AtN_start.index + yt_AtN_start[0].length);
+        if (rawObj) {
+            try {
+                const parsed = parseAttestationPayload(rawObj);
+                if (parsed.challenge?.bgChallenge || parsed.eacrToken) return parsed;
+            } catch {}
+        }
+    }
+
+    const ytAtR = txt.match(/window\.ytAtR\s*=\s*(?:(['"])((?:\\.|(?!\1)[\s\S])*)\1|(?=\{))/);
+    if (ytAtR) {
+        try {
+            const rawObj = ytAtR[2]
+                ? ytAtR[2]
+                      .replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+                      .replace(/\\(['"\\])/g, '$1')
+                : extractBalancedObject(txt, ytAtR.index + ytAtR[0].length);
+            if (rawObj) {
+                const parsed = parseAttestationPayload(rawObj);
+                if (parsed.challenge?.bgChallenge || parsed.eacrToken) return parsed;
+            }
+        } catch {}
+    }
+
+    const initial_start = txt.match(/initialAttestationDataJson\s*=\s*(?=\{)/);
+    if (initial_start) {
+        const rawObj = extractBalancedObject(txt, initial_start.index + initial_start[0].length);
+        if (rawObj) {
+            try {
+                const parsed = parseAttestationPayload(rawObj);
+                if (parsed.challenge?.bgChallenge || parsed.eacrToken) return parsed;
+            } catch {}
+        }
+    }
+
+    return {};
+}
+
+async function fetchHomepageAttestation(dom) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) {
+            await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        try {
+            const res = await fetch(YT_BASE, {
+                headers: {
+                    accept: '*/*',
+                    'accept-language': 'en-US,en;q=0.7',
+                    'user-agent': USER_AGENT,
+                    cookie: 'SOCS=CAI'
+                }
+            });
+            if (!res.ok) continue;
+
+            const txt = await res.text();
+            applyYtConfigFromHtml(dom, txt);
+            const extracted = extractHomepageAttestation(txt);
+            if (extracted.challenge?.bgChallenge || extracted.eacrToken) {
+                return extracted;
+            }
+        } catch {}
+    }
+    return {};
+}
+
+export async function getWebPo(useYouTubeAPI = true, options = {}) {
+    const { allow_fallback = false } = options;
+
+    while (minter_promise && (expires === 0 || expires > Date.now() + 15000)) {
+        if (cur && cur.isExhausted()) {
+            resetMinter();
+            break;
+        }
+
+        if (cur && cur_source && !canSourceServeRequest(cur_source, allow_fallback)) {
+            resetMinter();
+            break;
+        }
+
+        const pending = minter_promise;
+        const pending_allows_fallback = promise_allows_fallback;
+        let candidate;
+        try {
+            candidate = await pending;
+        } catch (error) {
+            if (allow_fallback && !pending_allows_fallback) {
+                if (!minter_promise) break;
+                continue;
+            }
+            throw error;
+        }
+
+        if (minter_promise !== pending) {
+            continue;
+        }
+
+        if (candidate?.isExhausted?.() || (cur_source && !canSourceServeRequest(cur_source, allow_fallback))) {
+            resetMinter();
+            break;
+        }
+
+        return candidate;
+    }
+
+    resetMinter();
+    promise_allows_fallback = allow_fallback;
+    const build_gen = minter_generation;
 
     let runtime_dom;
+    let runtime_client;
+    let runtime_global_name;
+    let runtime_vm_ref;
 
     minter_promise = (async () => {
         const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', {
             url: YT_BASE,
             referrer: `${YT_BASE}/`,
-            userAgent: USER_AGENT
+            resources: { userAgent: USER_AGENT }
         });
 
         runtime_dom = dom;
+        Object.defineProperty(dom.window.navigator, 'userAgent', {
+            value: USER_AGENT,
+            configurable: true
+        });
         Object.assign(globalThis, {
             window: dom.window,
             document: dom.window.document,
@@ -236,85 +503,15 @@ export async function getWebPo(useYouTubeAPI = true) {
             writable: true
         });
 
-        let key = REQUEST_KEY,
-            challenge,
-            eacrToken;
+        let key = REQUEST_KEY;
+        let req_UA = USER_AGENT;
+        let { challenge, eacrToken } = await fetchHomepageAttestation(dom);
+        let challenge_source = challenge?.bgChallenge ? 'homepage' : undefined;
 
-        try {
-            const res = await fetch(YT_BASE, {
-                headers: {
-                    accept: '*/*',
-                    'accept-language': 'en-US,en;q=0.7',
-                    'user-agent': USER_AGENT
-                }
-            });
-
-            const txt = await res.text();
-
-            dom.window.yt = dom.window.yt || { config_: {} };
-            dom.window.yt.config_ = dom.window.yt.config_ || {};
-
-            const cfg = txt.matchAll(/ytcfg\.set\(({.+?})\);/gs);
-
-            for (const match of cfg) {
-                try {
-                    Object.assign(dom.window.yt.config_, JSON.parse(match[1]));
-                } catch {
-                    try {
-                        Object.assign(dom.window.yt.config_, parse_json(match[1]));
-                    } catch {}
-                }
-            }
-
-            const reg_match = txt.matchAll(
-                /ytcfg\.set\(["']([A-Za-z0-9_]+)["']\s*,\s*(["'].*?["']|true|false|\d+|{[^}]+}|\[[^\]]+\])\);/gs
-            );
-
-            for (const match of reg_match) {
-                try {
-                    dom.window.yt.config_[match[1]] = JSON.parse(match[2]);
-                } catch {
-                    dom.window.yt.config_[match[1]] = match[2].replace(/^["']|["']$/g, '');
-                }
-            }
-
-            if (!dom.window.yt.config_.EVENT_ID) {
-                const event_reg = txt.match(/"EVENT_ID"\s*:\s*"([^"]+)"/);
-                if (event_reg) {
-                    dom.window.yt.config_.EVENT_ID = event_reg[1];
-                }
-            }
-
-            globalThis.yt = dom.window.yt;
-
-            const attestation = txt.match(/window\.ytAtN\(\s*({[\s\S]*?})\s*\)/);
-
-            if (attestation) {
-                try {
-                    const parsed = parse_json(attestation[1]);
-                    challenge = parsed.R?.bgChallenge ? parsed.R : parse_waa_challenge(parsed.R);
-                    eacrToken = parsed.T;
-                } catch {
-                    challenge = undefined;
-                }
-            }
-
-            //console.log(eacrToken)
-
-            if (!challenge?.bgChallenge && !eacrToken) {
-                const initialAttestationMatch = txt.match(/initialAttestationDataJson\s*=\s*({[\s\S]*?});/);
-
-                if (initialAttestationMatch) {
-                    try {
-                        const parsed = parse_json(initialAttestationMatch[1]);
-                        challenge = parsed.R?.bgChallenge ? parsed.R : parse_waa_challenge(parsed.R);
-                        eacrToken = parsed.T || eacrToken;
-                    } catch {}
-                }
-            }
-        } catch {}
-
-        if (!challenge?.bgChallenge) {
+        if (
+            !challenge?.bgChallenge &&
+            (eacrToken || allow_fallback || process.env.ALLOW_UNBOUND_ATT_FALLBACK === 'true')
+        ) {
             try {
                 const payload = {
                     context: {
@@ -346,41 +543,62 @@ export async function getWebPo(useYouTubeAPI = true) {
                 if (!attestation?.bgChallenge) throw new Error('could not get challenge from att/get');
 
                 challenge = { bgChallenge: attestation.bgChallenge };
+                challenge_source = eacrToken ? 'att_eacr' : 'att_unbound';
             } catch {
                 challenge = undefined;
+                challenge_source = undefined;
             }
         }
 
-        if (!challenge?.bgChallenge) {
-            const waa_res = await fetch(buildURL('Create', false), {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json+protobuf',
-                    'x-goog-api-key': INNERTUBE_API_KEY,
-                    'x-user-agent': 'grpc-web-javascript/0.1',
-                    'user-agent': USER_AGENT
-                },
-                body: JSON.stringify([key])
-            });
+        if (!challenge?.bgChallenge && (allow_fallback || process.env.ALLOW_WAA_CREATE_FALLBACK === 'true')) {
+            try {
+                const waa_res = await fetch(buildURL('Create', false), {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json+protobuf',
+                        'x-goog-api-key': INNERTUBE_API_KEY,
+                        'x-user-agent': 'grpc-web-javascript/0.1',
+                        'user-agent': USER_AGENT
+                    },
+                    body: JSON.stringify([key])
+                });
 
-            if (!waa_res.ok) throw new Error(`WAA Create returned ${waa_res.status}`);
+                if (!waa_res.ok) throw new Error(`WAA Create returned ${waa_res.status}`);
 
-            challenge = parse_waa_challenge(await waa_res.json());
+                challenge = parse_waa_challenge(await waa_res.json());
+                if (challenge?.bgChallenge) {
+                    challenge_source = 'waa_create';
+                }
+            } catch {
+                challenge = undefined;
+                challenge_source = undefined;
+            }
         }
 
-        if (!challenge?.bgChallenge) {
+        if (!challenge?.bgChallenge && (allow_fallback || process.env.ALLOW_TV_CONFIG_FALLBACK === 'true')) {
             try {
-                const res = await fetch(TV_CONFIG, { headers: { accept: '*/*', 'user-agent': TV_USER_AGENT } });
-                const txt = await res.text();
+                const res = await fetchTextHttps(TV_CONFIG, {
+                    accept: '*/*',
+                    'user-agent': TV_USER_AGENT
+                });
+                if (!res.ok) throw new Error(`tv_config returned ${res.status}`);
+                if (!res.text.startsWith(')]}')) throw new Error('invalid yt tv config response');
 
-                if (!txt.startsWith(')]}')) throw new Error('invalid yt tv config response');
-
-                const json = JSON.parse(txt.slice(4));
+                const json = JSON.parse(res.text.slice(4));
 
                 challenge = json.challengeParams?.R ? JSON.parse(json.challengeParams.R) : undefined;
                 key = json.challengeRequestKey || key;
+                if (challenge?.bgChallenge) {
+                    challenge_source = 'tv_config';
+                    req_UA = TV_USER_AGENT;
+                    Object.defineProperty(dom.window.navigator, 'userAgent', {
+                        value: TV_USER_AGENT,
+                        configurable: true
+                    });
+                }
             } catch {
                 challenge = undefined;
+                challenge_source = undefined;
             }
         }
 
@@ -388,23 +606,30 @@ export async function getWebPo(useYouTubeAPI = true) {
 
         const interpreterUrl =
             challenge.bgChallenge.interpreterUrl?.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue;
-        //console.log(interpreterUrl)
         const inlineInterpreter =
             challenge.bgChallenge.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
-        const interpreter =
-            inlineInterpreter || (interpreterUrl ? await (await fetch(`https:${interpreterUrl}`)).text() : '');
+        let interpreter = inlineInterpreter || '';
+        if (!interpreter && interpreterUrl) {
+            const interp_res = await fetch(`https:${interpreterUrl}`, {
+                headers: { 'user-agent': req_UA }
+            });
+            if (!interp_res.ok) throw new Error(`BotGuard interpreter returned ${interp_res.status}`);
+            interpreter = await interp_res.text();
+        }
 
         if (!interpreter) throw new Error("couldn't load botguard interpreter");
 
-        //console.log(challenge.bgChallenge);
-
         new Function(interpreter)();
+
+        runtime_global_name = challenge.bgChallenge.globalName;
+        runtime_vm_ref = globalThis[runtime_global_name];
 
         const client = await create_bg({
             program: challenge.bgChallenge.program,
-            globalName: challenge.bgChallenge.globalName,
+            globalName: runtime_global_name,
             globalObject: globalThis
         });
+        runtime_client = client;
 
         const signals = [];
         const res = await client.snapshot({ webPoSignalOutput: signals });
@@ -416,7 +641,7 @@ export async function getWebPo(useYouTubeAPI = true) {
                 'content-type': 'application/json+protobuf',
                 'x-goog-api-key': request_key,
                 'x-user-agent': 'grpc-web-javascript/0.1',
-                'user-agent': USER_AGENT
+                'user-agent': req_UA
             },
             body: JSON.stringify([key, res])
         });
@@ -429,7 +654,16 @@ export async function getWebPo(useYouTubeAPI = true) {
             await t_txt.json();
         const ttl = Number(estimated_ttl_secs);
 
-        expires = Date.now() + Math.max(1, (Number.isFinite(ttl) && ttl > 0 ? ttl : 300) - 30) * 1000;
+        const isWebAttested = challenge_source === 'homepage' || challenge_source === 'att_eacr';
+        const maxMinterLifetimeMs = process.env.MAX_MINTER_TTL
+            ? Number(process.env.MAX_MINTER_TTL)
+            : 2 * 60 * 60 * 1000; // 2 hours max lifetime
+        const fallbackLifetimeMs = process.env.FALLBACK_MINTER_TTL
+            ? Number(process.env.FALLBACK_MINTER_TTL)
+            : 15 * 60 * 1000; // 15 mins max lifetime for fallback extractors so homepage retries regularly
+        const lifetimeCapMs = isWebAttested ? maxMinterLifetimeMs : Math.min(maxMinterLifetimeMs, fallbackLifetimeMs);
+        const ttlMs = Math.max(1, (Number.isFinite(ttl) && ttl > 0 ? ttl : 300) - 30) * 1000;
+        expires = Date.now() + Math.min(ttlMs, lifetimeCapMs);
 
         const minter = await Minter.create(
             {
@@ -440,35 +674,60 @@ export async function getWebPo(useYouTubeAPI = true) {
             },
             signals,
             client,
-            dom
+            dom,
+            runtime_global_name,
+            runtime_vm_ref
         );
         minter.expiresAt = expires;
 
+        if (build_gen !== minter_generation) {
+            throw new Error('Minter session invalidated');
+        }
+
         cur = minter;
+        cur_source = challenge_source;
 
         return minter;
     })();
     try {
         return await minter_promise;
     } catch (error) {
-        release_dom(runtime_dom);
-        minter_promise = undefined;
-        expires = 0;
+        await disposeRuntime(runtime_dom, runtime_client, runtime_global_name, runtime_vm_ref);
+        if (build_gen === minter_generation) {
+            cur = undefined;
+            cur_source = undefined;
+            minter_promise = undefined;
+            promise_allows_fallback = false;
+            expires = 0;
+        }
         throw error;
     }
 }
 
-export async function fetch_pot(contentBinding, useYouTubeAPI = true, ttl = null) {
-    const minter = await getWebPo(useYouTubeAPI);
-    const minter_expires = minter.expiresAt || expires;
-    const token_expires = Number.isFinite(ttl) && ttl > 0 ? Math.min(minter_expires, Date.now() + ttl) : minter_expires;
+export async function fetch_pot(contentBinding, useYouTubeAPI = true, ttl = null, options = {}) {
+    let minter;
+    try {
+        const allow_fallback =
+            typeof options?.allow_fallback === 'boolean' ? options.allow_fallback : !isVideoIdBinding(contentBinding);
+        minter = await getWebPo(useYouTubeAPI, { allow_fallback });
+        const minter_expires = minter.expiresAt || expires;
+        const token_expires =
+            Number.isFinite(ttl) && ttl > 0 ? Math.min(minter_expires, Date.now() + ttl) : minter_expires;
 
-    return {
-        poToken: await minter.mintAsWebsafeString(contentBinding),
-        contentBinding,
-        ttl: Math.max(0, Math.floor((token_expires - Date.now()) / 1000)),
-        minterSession: minter.integrityTokenData?.integrity_token || null
-    };
+        return {
+            poToken: await minter.mintAsWebsafeString(contentBinding),
+            contentBinding,
+            ttl: Math.max(0, Math.floor((token_expires - Date.now()) / 1000)),
+            minterSession: minter.integrityTokenData?.integrity_token || null
+        };
+    } catch (error) {
+        if (!minter || cur === minter) {
+            resetMinter();
+        } else {
+            minter.retire();
+        }
+        throw error;
+    }
 }
 
 // this token only bridges the short period before yt moves sps from 2 to 3

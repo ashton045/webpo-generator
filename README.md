@@ -52,6 +52,13 @@ I cannot give you the guarantee of full uptime but i'll do my best to keep it up
 - **REQUEST_TIMEOUT** - timeout in ms, default is `30000`
 - **CACHE_SIZE** - max cached bindings, default is `100`
 - **VISITOR_TTL** - visistorId ttl in ms, default is `600000`
+- **MAX_CACHE_TTL** - max `videoId` token cache ttl in ms, default is `21600000` (`6h`)
+- **LR_TTL** - `livingRoomPoTokenId` cache ttl in ms, default is `3600000` (`1h`)
+- **MAX_MINTER_TTL** - max cached minter lifetime in ms, default is `7200000` (`2h`)
+- **FALLBACK_MINTER_TTL** - max fallback minter lifetime in ms, default is `900000` (`15m`)
+- **ALLOW_UNBOUND_ATT_FALLBACK** - allow unbound `att/get` for `videoId` bindings when `true`, default `false`
+- **ALLOW_WAA_CREATE_FALLBACK** - allow WAA `Create` for `videoId` bindings when `true`, default `false`
+- **ALLOW_TV_CONFIG_FALLBACK** - allow `tv_config` for `videoId` bindings when `true`, default `false`
 
 ## IPv6/IPv4 bindings
 it's very simple to bind your host to either IPv4/IPv6 interface is by setting `HOST=0.0.0.0` or `HOST=::` in your environment. To access the service locally use `http://localhost:8080` or `http://[::1]:8001` or insert an actual IPv4/IPv6 to get access from another device.
@@ -145,6 +152,29 @@ Decodes a cold start token. This endpoint does not mint, cache, or validate the 
 }
 ```
 
+### `POST /invalidate`
+
+Invalidates cached tokens and minter state. Accepts an optional JSON body:
+```json
+{
+  "po_token": "...",
+  "content_binding": "..."
+}
+```
+When `po_token` or `content_binding` is provided, only the matching cached entry and the worker minter session that minted it are invalidated (leaving other active minters and unrelated cached tokens intact). When called with an empty body (`{}`), it clears all caches across workers.
+
+Expect response:
+```json
+{
+  "success": true,
+  "message": "..."
+}
+```
+
+### `GET /minter_cache`
+
+Returns `current_minter_session` (or `null`) and the active `workers` count.
+
 > [!Note]
 > Prometheus metrics include htt request totals, response totals, latency histograms, generation outcomes, cache hits/misses, pending requests, queue depth, worker count, and nodejs runtime metrics.
 
@@ -162,27 +192,29 @@ An attestation is not the final PoT btw cuz it's evidence produced by the botgua
 
 ### How a WebPO token is generated
 
-The service can obtain a botguard challenge through 4 fallback methods. They are ordered from highest success rates to lowest:
+The service can obtain a botguard challenge through 4 methods, ordered from highest compatibility to lowest:
 
-1. **yt homepage** - The service fetches the initial/home page, extracts `ytcfg.set(...)`, installs the `ytcfg` into the virtual page, and reads the `window.ytAtN(...)` challenge and `EVENT_ID`.
-2. **innertube att** - sends a POST request to `/youtubei/v1/att/get?prettyPrint=false` with a `WEB` client ctx and `eacrToken` to receives the botguard challenge directly.
-3. **WAA Create RPC** - sends the request key to Google's WAA `Create` endpoint. The response can be encoded, so the service decodes it before reading the program, global name, and interpreter infos.
-4. **tv config** - fetches `tv_config`, which contains challenge data directly and does not depend on the homepage event data.
+1. **yt homepage** - The service fetches the home page (with `SOCS=CAI` cookie and a `250ms` retry if needed), extracts `ytcfg.set(...)` and `EVENT_ID` into the virtual page, and reads the challenge and `eacrToken` from `window.ytAtN(...)`, `window.ytAtR`, or `initialAttestationDataJson`. Works for all bindings.
+2. **innertube att** - sends a `POST` request to `/youtubei/v1/att/get?prettyPrint=false` with a `WEB` client ctx (and `eacrToken` when available) to receive the botguard challenge directly. Calling it without `eacrToken` only runs as a fallback for `non videoId` bindings (unless overridden).
+3. **WAA Create RPC** - sends the request key to Google's `WAA Create` endpoint (`$rpc/google.internal.waa.v1.Waa/Create`) as a fallback for `non videoId` bindings (unless overridden). The response can be encoded, so the service decodes it before reading the program, global name, and interpreter info.
+4. **tv config** - fetches `/tv_config` via `node:https` for `non videoId` bindings (unless overridden), which contains challenge data directly and does not depend on homepage event data.
 
-The harcoded innertube key is being used in here for certain requests, as that key has been registered for google's private apis.
+Fallback minters (unbound `att/get`, `WAA Create`, `tv_config`) are never reused for `videoId` requests. If a `videoId` request comes in while a fallback minter is cached, the service resets it and fetches a `videoId` compatible challenge (`yt homepage` or `eacrToken` with `att/get`) instead.
 
-After the challenge is fetched and then it loads the interpreter js.
+The hardcoded innertube key is being used in here for certain requests, as that key has been registered for google's private apis.
 
-The interpreter is executed with `new Function()` inside a `JSDOM` based mimicked browser env. The bytecode program is then passed into the vm.
+After the challenge is fetched, it loads the interpreter js using the same user agent.
 
-The snapshot collects the runtime signals and produces the botguard response. The service sends that response to the `GenerateIT` endpoint together with the request key. GenerateIT returns an `integrity token` and its estimated lifetime.
+The interpreter is executed with `new Function()` inside a `JSDOM` based mimicked browser env (with a matching `navigator.userAgent`, or `TV_USER_AGENT` for `tv_config`). The bytecode program is then passed into the vm.
 
-The integrity token is passed to the `WebPO minter` function returned by botguard. The minter then receives the PoToken:
+The snapshot collects the runtime signals and produces the botguard response. The service sends that response to the `GenerateIT` endpoint together with the request key. GenerateIT returns an `integrity token`, its estimated lifetime, and a mint refresh threshold.
+
+The integrity token is passed to the `WebPO minter` function returned by botguard, which stays cached up to its TTL. The minter then produces the PoToken:
 
 ```text
 content binding → botguard minter → WebPO bytes → websafe Base64 PoT
 ```
 
-The content binding is either a video id or visitor data. Real PoT results are cached according to the binding type and lifetime. Cold start tokens are optional bootstrap values for the temporary `sps=2` state.\
+The content binding is a `videoId`, a `livingRoomPoTokenId`, or `visitorData`. Real pot results are cached for videoIds, living room pot Ids, and internal server generated visitor data according to their lifetime, while explicit visitor data is not cached and entries expire by TTL or get evicted on targeted `/invalidate`. Cold start tokens are optional bootstrap values for the temporary `sps=2` state.
 
 Thanks to [Deivu](https://github.com/Deivu) helped populating the sources :)
