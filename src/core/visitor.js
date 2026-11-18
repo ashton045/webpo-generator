@@ -8,9 +8,59 @@ import {
 } from '../utils/constants.js';
 
 let visitorData;
+let visitorGl = null;
 let visitor_expires = 0;
 let reqs;
 let generation = 0;
+
+export function parseSwJsData(data) {
+    if (typeof data !== 'string' || !data.trim()) return null;
+    const cleaned = data.replace(/^\)\]\}'\s*/, '');
+    let parsed;
+    try {
+        parsed = JSON.parse(cleaned);
+    } catch {
+        return null;
+    }
+
+    const row = parsed?.[0]?.[2]?.[0]?.[0];
+    if (!Array.isArray(row)) return null;
+
+    const gl = typeof row[1] === 'string' && /^[A-Za-z]{2}$/.test(row[1]) ? row[1].toUpperCase() : null;
+    let found = null;
+    for (const cell of row) {
+        if (typeof cell === 'string' && /^Cg[A-Za-z0-9_%=-]{12,}$/.test(cell)) {
+            try {
+                found = decodeURIComponent(cell);
+            } catch {
+                found = cell;
+            }
+            break;
+        }
+    }
+
+    if (!found && !gl) return null;
+    return { visitorData: found, gl };
+}
+
+export async function fetchSwJsSession(timeout = 15000) {
+    const res = await fetch(`${YT_BASE}/sw.js_data`, {
+        headers: {
+            accept: '*/*',
+            'accept-language': 'en-US,en;q=0.9',
+            'user-agent': USER_AGENT
+        },
+        signal: AbortSignal.timeout(timeout)
+    });
+
+    if (!res.ok) throw new Error(`sw.js_data returned ${res.status}`);
+
+    const parsed = parseSwJsData(await res.text());
+    if (!parsed?.visitorData) {
+        throw new Error('visitor data was not found in sw.js_data');
+    }
+    return parsed;
+}
 
 function extract(value) {
     if (!value || typeof value !== 'object') return;
@@ -80,43 +130,55 @@ async function visitor_endpoint(timeout) {
     return decodeURIComponent(result);
 }
 
-export function getVisitorData(ttl = 10 * 60 * 1000, timeout = 30000) {
-    if (visitorData && visitor_expires > Date.now()) return Promise.resolve(visitorData);
+export async function getVisitorSession(ttl = 10 * 60 * 1000, timeout = 30000) {
+    if (visitorData && visitor_expires > Date.now()) {
+        return { visitorData, gl: visitorGl };
+    }
 
     if (reqs) return reqs;
 
     const epoch = generation;
-    const currentReq = (async () => {
+    const cur_req = (async () => {
         try {
-            return await fetch_initial_page(timeout);
-        } catch (e) {
+            return await fetchSwJsSession(timeout);
+        } catch (swErr) {
             try {
-                return await visitor_endpoint(timeout);
-            } catch (e2) {
-                throw new Error(`could not generate visitor data: ${e.message}; ${e2.message}`);
+                return { visitorData: await fetch_initial_page(timeout), gl: null };
+            } catch (e) {
+                try {
+                    return { visitorData: await visitor_endpoint(timeout), gl: null };
+                } catch (e2) {
+                    throw new Error(`could not generate visitor data: ${swErr.message}; ${e.message}; ${e2.message}`);
+                }
             }
         }
     })()
-        .then((v) => {
+        .then((session) => {
             if (epoch === generation) {
-                visitorData = v;
+                visitorData = session.visitorData;
+                visitorGl = session.gl || null;
                 visitor_expires = Date.now() + ttl;
             }
-            return v;
+            return session;
         })
         .finally(() => {
-            if (reqs === currentReq) {
+            if (reqs === cur_req) {
                 reqs = undefined;
             }
         });
 
-    reqs = currentReq;
-    return currentReq;
+    reqs = cur_req;
+    return cur_req;
+}
+
+export function getVisitorData(ttl = 10 * 60 * 1000, timeout = 30000) {
+    return getVisitorSession(ttl, timeout).then((session) => session.visitorData);
 }
 
 export function resetVisitorData() {
     generation++;
     visitorData = undefined;
+    visitorGl = null;
     visitor_expires = 0;
     reqs = undefined;
 }

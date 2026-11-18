@@ -33,7 +33,9 @@ export function createWorkerPool({
     const workers = [];
     const queue = [];
     let stopped = false;
-    let activeTz = getSystemTimezone();
+    const initialSystemTz = getSystemTimezone();
+    const allowGeoSync = !initialSystemTz || initialSystemTz === 'UTC' || initialSystemTz === 'Etc/UTC';
+    let active_tz = initialSystemTz;
     let workerTzOverride = null;
 
     function replaceWorkerForTimezone(item) {
@@ -53,9 +55,26 @@ export function createWorkerPool({
 
         try {
             item.worker.terminate();
-        } catch {}
+        } catch { }
 
         start();
+    }
+
+    function applyTimezone(tz, triggeringItem = null) {
+        if (!allowGeoSync || !isValidTimezone(tz) || active_tz === tz) {
+            return false;
+        }
+        workerTzOverride = tz;
+        active_tz = tz;
+        process.env.TZ = tz;
+        new Date().getTimezoneOffset();
+        for (const w of [...workers]) {
+            if (w.tz !== active_tz && (!w.busy || w === triggeringItem)) {
+                replaceWorkerForTimezone(w);
+            }
+        }
+        dispatch();
+        return true;
     }
 
     function start() {
@@ -65,23 +84,12 @@ export function createWorkerPool({
             busy: false,
             task: undefined,
             minterSession: null,
-            tz: workerTzOverride || activeTz
+            tz: workerTzOverride || active_tz
         };
 
         item.worker.on('message', (msg) => {
             if (msg?.type === 'sync_tz') {
-                const systemTz = getSystemTimezone();
-                const canOverride = !systemTz || systemTz === 'UTC' || systemTz === 'Etc/UTC';
-                if (canOverride && isValidTimezone(msg.tz) && activeTz !== msg.tz) {
-                    workerTzOverride = msg.tz;
-                    activeTz = msg.tz;
-                    for (const w of [...workers]) {
-                        if (w.tz !== activeTz && (!w.busy || w === item)) {
-                            replaceWorkerForTimezone(w);
-                        }
-                    }
-                    dispatch();
-                }
+                applyTimezone(msg.tz, item);
                 return;
             }
 
@@ -107,7 +115,7 @@ export function createWorkerPool({
                 );
             }
 
-            if (activeTz && item.tz !== activeTz && !stopped) {
+            if (active_tz && item.tz !== active_tz && !stopped) {
                 replaceWorkerForTimezone(item);
             }
 
@@ -198,6 +206,9 @@ export function createWorkerPool({
                 queue: queue.length
             };
         },
+        setTimezone(tz) {
+            return applyTimezone(tz, null);
+        },
         invalidate(minterSession = null) {
             for (const item of workers) {
                 if (minterSession && item.minterSession !== minterSession) {
@@ -206,7 +217,7 @@ export function createWorkerPool({
                 item.minterSession = null;
                 try {
                     item.worker.postMessage({ type: 'invalidate', minterSession });
-                } catch {}
+                } catch { }
             }
         },
         async close() {
