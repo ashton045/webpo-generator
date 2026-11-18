@@ -3,16 +3,38 @@ import { fileURLToPath } from 'node:url';
 
 const file = fileURLToPath(new URL('./worker.js', import.meta.url));
 
+function getSystemTimezone() {
+    try {
+        return Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+    } catch {
+        return null;
+    }
+}
+
+function isValidTimezone(tz) {
+    if (typeof tz !== 'string' || !tz || tz === 'UTC' || tz === 'Etc/UTC') {
+        return false;
+    }
+    try {
+        Intl.DateTimeFormat(undefined, { timeZone: tz });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 export function createWorkerPool({
     workers: worker_counts,
     queueSize,
     timeout,
     metrics,
-    workerFactory = () => new Worker(file)
+    workerFactory = (env) => new Worker(file, env ? { env } : undefined)
 }) {
     const workers = [];
     const queue = [];
     let stopped = false;
+    let activeTz = getSystemTimezone();
+    let workerTzOverride = null;
 
     function replaceWorkerForTimezone(item) {
         if (item.failed || stopped) return;
@@ -37,26 +59,29 @@ export function createWorkerPool({
     }
 
     function start() {
+        const workerEnv = workerTzOverride ? { ...process.env, TZ: workerTzOverride } : undefined;
         const item = {
-            worker: workerFactory(),
+            worker: workerEnv ? workerFactory(workerEnv) : workerFactory(),
             busy: false,
             task: undefined,
             minterSession: null,
-            tz: process.env.TZ || null
+            tz: workerTzOverride || activeTz
         };
 
         item.worker.on('message', (msg) => {
-            if (msg?.type === 'sync_tz' && typeof msg.tz === 'string') {
-                if (process.env.TZ !== msg.tz) {
-                    process.env.TZ = msg.tz;
-                    new Date().getTimezoneOffset();
-                }
-                for (const w of [...workers]) {
-                    if (w.tz !== msg.tz && (!w.busy || w === item)) {
-                        replaceWorkerForTimezone(w);
+            if (msg?.type === 'sync_tz') {
+                const systemTz = getSystemTimezone();
+                const canOverride = !systemTz || systemTz === 'UTC' || systemTz === 'Etc/UTC';
+                if (canOverride && isValidTimezone(msg.tz) && activeTz !== msg.tz) {
+                    workerTzOverride = msg.tz;
+                    activeTz = msg.tz;
+                    for (const w of [...workers]) {
+                        if (w.tz !== activeTz && (!w.busy || w === item)) {
+                            replaceWorkerForTimezone(w);
+                        }
                     }
+                    dispatch();
                 }
-                dispatch();
                 return;
             }
 
@@ -80,6 +105,10 @@ export function createWorkerPool({
                         code: 'GENERATION_FAILED'
                     })
                 );
+            }
+
+            if (activeTz && item.tz !== activeTz && !stopped) {
+                replaceWorkerForTimezone(item);
             }
 
             dispatch();
