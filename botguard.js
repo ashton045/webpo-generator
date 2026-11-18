@@ -1,4 +1,6 @@
 import https from 'node:https';
+import { parentPort } from 'node:worker_threads';
+import ct from 'countries-and-timezones';
 import { JSDOM } from 'jsdom';
 import {
     COLD_START_MAX_BINDING_BYTES,
@@ -32,6 +34,8 @@ function fetchTextHttps(urlStr, headers = {}, maxHeaderSize = 65536, timeoutMs =
     });
 }
 
+const DEFAULT_NAVIGATOR = globalThis.navigator;
+
 export function release_dom(dom, globalName, vmRef) {
     if (globalName && (vmRef === undefined || globalThis[globalName] === vmRef)) {
         try {
@@ -44,12 +48,19 @@ export function release_dom(dom, globalName, vmRef) {
     if (!dom) return;
 
     if (globalThis.window === dom.window) {
-        for (const property of ['window', 'document', 'location', 'origin', 'yt', 'navigator']) {
+        for (const property of ['window', 'document', 'location', 'origin', 'yt']) {
             try {
                 delete globalThis[property];
             } catch {
                 globalThis[property] = undefined;
             }
+        }
+        if (DEFAULT_NAVIGATOR !== undefined) {
+            Object.defineProperty(globalThis, 'navigator', {
+                value: DEFAULT_NAVIGATOR,
+                configurable: true,
+                writable: true
+            });
         }
     }
 
@@ -260,6 +271,16 @@ export function isVideoIdBinding(binding) {
     return /^[A-Za-z0-9_-]{11}$/.test(key);
 }
 
+export function isLivingRoomIdBinding(binding) {
+    if (typeof binding !== 'string') return false;
+    let key = binding.trim();
+    if (!key) return false;
+    try {
+        key = decodeURIComponent(key);
+    } catch {}
+    return /^[A-Za-z0-9+/_-]{11}=$/.test(key);
+}
+
 function canSourceServeRequest(source, allow_fallback) {
     if (source === 'homepage' || source === 'att_eacr') return true;
     if (allow_fallback) return true;
@@ -283,7 +304,40 @@ export function resetMinter(sessionToken = null) {
     return true;
 }
 
-function applyYtConfigFromHtml(dom, txt) {
+function resolveTimezoneForCountry(gl) {
+    if (typeof gl !== 'string' || !gl.trim()) return null;
+    const code = gl.trim().toUpperCase();
+    const country = ct.getCountry?.(code) || ct.default?.getCountry?.(code);
+    if (country?.timezones?.length) {
+        return country.timezones[0];
+    }
+    try {
+        const locale = new Intl.Locale(`und-${code}`);
+        const zones = locale.getTimeZones?.() || locale.timeZones;
+        if (Array.isArray(zones) && zones.length > 0) {
+            return zones[0];
+        }
+    } catch {}
+    return null;
+}
+
+async function syncTimezoneWithGeo(gl) {
+    const targetTz = resolveTimezoneForCountry(gl);
+    if (!targetTz) return;
+    try {
+        const currentTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        if (!currentTz || currentTz === 'UTC' || currentTz === 'Etc/UTC') {
+            process.env.TZ = targetTz;
+            new Date().getTimezoneOffset();
+            if (parentPort) {
+                parentPort.postMessage({ type: 'sync_tz', tz: targetTz });
+                await new Promise((resolve) => setTimeout(resolve, 15));
+            }
+        }
+    } catch {}
+}
+
+async function applyYtConfigFromHtml(dom, txt) {
     dom.window.yt = { config_: {} };
 
     for (const match of txt.matchAll(/ytcfg\.set\(({.+?})\);/gs)) {
@@ -314,6 +368,12 @@ function applyYtConfigFromHtml(dom, txt) {
             dom.window.yt.config_.EVENT_ID = event_reg[1];
         }
     }
+
+    const gl =
+        dom.window.yt.config_.INNERTUBE_CONTEXT_GL ||
+        dom.window.yt.config_.GL ||
+        dom.window.yt.config_.INNERTUBE_CONTEXT?.client?.gl;
+    await syncTimezoneWithGeo(gl);
 
     globalThis.yt = dom.window.yt;
 }
@@ -420,7 +480,7 @@ async function fetchHomepageAttestation(dom) {
             if (!res.ok) continue;
 
             const txt = await res.text();
-            applyYtConfigFromHtml(dom, txt);
+            await applyYtConfigFromHtml(dom, txt);
             const extracted = extractHomepageAttestation(txt);
             if (extracted.challenge?.bgChallenge || extracted.eacrToken) {
                 return extracted;
@@ -631,30 +691,48 @@ export async function getWebPo(useYouTubeAPI = true, options = {}) {
         });
         runtime_client = client;
 
-        const signals = [];
-        const res = await client.snapshot({ webPoSignalOutput: signals });
         const endpoint = buildURL('GenerateIT', useYouTubeAPI);
-
-        const generate_options = (request_key) => ({
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json+protobuf',
-                'x-goog-api-key': request_key,
-                'x-user-agent': 'grpc-web-javascript/0.1',
-                'user-agent': req_UA
-            },
-            body: JSON.stringify([key, res])
-        });
-
-        let t_txt = await fetch(endpoint, generate_options(INNERTUBE_API_KEY));
-
-        if (!t_txt.ok) throw new Error(`GenerateIT returned ${t_txt.status}`);
-
-        const [integrity_token, estimated_ttl_secs, mint_refresh_threshold, websafe_fallback_token] =
-            await t_txt.json();
-        const ttl = Number(estimated_ttl_secs);
-
         const isWebAttested = challenge_source === 'homepage' || challenge_source === 'att_eacr';
+        const maxItAttempts = isWebAttested ? 4 : 1;
+
+        let signals = [];
+        let integrity_token;
+        let estimated_ttl_secs;
+        let mint_refresh_threshold;
+        let websafe_fallback_token;
+
+        for (let itAttempt = 0; itAttempt < maxItAttempts; itAttempt++) {
+            if (itAttempt > 0) {
+                await new Promise((resolve) => setTimeout(resolve, 100 * itAttempt));
+            }
+            signals = [];
+            const res = await client.snapshot({ webPoSignalOutput: signals });
+
+            const generate_options = (request_key) => ({
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json+protobuf',
+                    'x-goog-api-key': request_key,
+                    'x-user-agent': 'grpc-web-javascript/0.1',
+                    'user-agent': req_UA,
+                    origin: YT_BASE,
+                    referer: `${YT_BASE}/`
+                },
+                body: JSON.stringify([key, res])
+            });
+
+            const t_txt = await fetch(endpoint, generate_options(INNERTUBE_API_KEY));
+
+            if (!t_txt.ok) throw new Error(`GenerateIT returned ${t_txt.status}`);
+
+            [integrity_token, estimated_ttl_secs, mint_refresh_threshold, websafe_fallback_token] = await t_txt.json();
+
+            if (!integrity_token || base64ToUint8(integrity_token).length <= 66) {
+                break;
+            }
+        }
+
+        const ttl = Number(estimated_ttl_secs);
         const maxMinterLifetimeMs = process.env.MAX_MINTER_TTL
             ? Number(process.env.MAX_MINTER_TTL)
             : 2 * 60 * 60 * 1000; // 2 hours max lifetime
@@ -708,7 +786,9 @@ export async function fetch_pot(contentBinding, useYouTubeAPI = true, ttl = null
     let minter;
     try {
         const allow_fallback =
-            typeof options?.allow_fallback === 'boolean' ? options.allow_fallback : !isVideoIdBinding(contentBinding);
+            typeof options?.allow_fallback === 'boolean'
+                ? options.allow_fallback
+                : !isVideoIdBinding(contentBinding) && !isLivingRoomIdBinding(contentBinding);
         minter = await getWebPo(useYouTubeAPI, { allow_fallback });
         const minter_expires = minter.expiresAt || expires;
         const token_expires =

@@ -23,6 +23,12 @@ export function createWorkerPool({
         };
 
         item.worker.on('message', (msg) => {
+            if (msg?.type === 'sync_tz' && typeof msg.tz === 'string') {
+                process.env.TZ = msg.tz;
+                new Date().getTimezoneOffset();
+                return;
+            }
+
             if (!item.task) return;
 
             const task = item.task;
