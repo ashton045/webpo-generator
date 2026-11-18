@@ -714,8 +714,20 @@ export async function fetch_pot(contentBinding, useYouTubeAPI = true, ttl = null
         const token_expires =
             Number.isFinite(ttl) && ttl > 0 ? Math.min(minter_expires, Date.now() + ttl) : minter_expires;
 
+        let poToken = await minter.mintAsWebsafeString(contentBinding);
+        // BotGuard sometimes returns a longer unattested token (SABR sps=2).
+        // A second mint usually gives a short attested one.
+        const bindingBytes = new TextEncoder().encode(contentBinding).length;
+        for (let i = 0; i < 2 && (base64ToUint8(poToken).length - bindingBytes) > 79; i++) {
+            try {
+                poToken = await minter.mintAsWebsafeString(contentBinding);
+            } catch {
+                break;
+            }
+        }
+
         return {
-            poToken: await minter.mintAsWebsafeString(contentBinding),
+            poToken,
             contentBinding,
             ttl: Math.max(0, Math.floor((token_expires - Date.now()) / 1000)),
             minterSession: minter.integrityTokenData?.integrity_token || null
