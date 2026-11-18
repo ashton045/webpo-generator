@@ -1,8 +1,9 @@
 import http from 'node:http';
 import { createWorkerPool } from './src/core/workerPool.js';
 import { createCache } from './src/core/cache.js';
-import { getVisitorData, resetVisitorData } from './src/core/visitor.js';
-import { createColdStartToken, decodeColdStartToken } from './botguard.js';
+import { getVisitorData, getVisitorSession, resetVisitorData } from './src/core/visitor.js';
+import { createColdStartToken, decodeColdStartToken } from './src/utils/coldStart.js';
+import { resolveTimezoneForCountry } from './src/utils/timezone.js';
 import { isAuthorized } from './src/middleware/auth.js';
 import { validateColdStartDecode, validateGeneration } from './src/middleware/validation.js';
 import {
@@ -463,6 +464,33 @@ const server = http.createServer((req, res) => {
 
 server.requestTimeout = server.headersTimeout = 15000;
 
+let is_shutdow_started = false;
+
+async function prewarm() {
+    if (process.env.PREWARM === 'false' || is_shutdow_started) {
+        return;
+    }
+    try {
+        const session = await getVisitorSession(visitorTtl, 15000);
+        if (is_shutdow_started || !session?.visitorData) {
+            return;
+        }
+        if (session.gl) {
+            const target_tz = resolveTimezoneForCountry(session.gl);
+            if (target_tz) {
+                pool.setTimezone(target_tz);
+            }
+        }
+        if (!is_shutdow_started) {
+            await generate(session.visitorData, false, null);
+        }
+    } catch (error) {
+        if (!is_shutdow_started) {
+            console.warn(`prewarmup skipped: ${error.message}`);
+        }
+    }
+}
+
 function listen(host) {
     server.once('error', (error) => {
         if (host == '::') {
@@ -477,12 +505,14 @@ function listen(host) {
     const addr = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
     server.listen({ host, port }, () => {
         console.log(`api listening on http://${addr}:${port} with ${workers} worker(s)`);
+        void prewarm();
     });
 }
 
 listen(host);
 
 async function shutdown(signal) {
+    is_shutdow_started = true;
     console.log(`${signal}: shutting down`);
     cache.close();
     lr_cache.close();

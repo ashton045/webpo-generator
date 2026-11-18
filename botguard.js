@@ -1,9 +1,7 @@
 import https from 'node:https';
 import { parentPort } from 'node:worker_threads';
-import ct from 'countries-and-timezones';
 import { JSDOM } from 'jsdom';
 import {
-    COLD_START_MAX_BINDING_BYTES,
     INNERTUBE_API_KEY,
     REQUEST_KEY,
     TV_CONFIG,
@@ -13,7 +11,11 @@ import {
     WEB_CLIENT_NAME,
     WEB_CLIENT_VERSION
 } from './src/utils/constants.js';
+import { createColdStartToken, decodeColdStartToken } from './src/utils/coldStart.js';
 import { base64ToUint8, buildURL, parse_json, Uint8ToBase64 } from './src/utils/helpers.js';
+import { resolveTimezoneForCountry } from './src/utils/timezone.js';
+
+export { createColdStartToken, decodeColdStartToken, resolveTimezoneForCountry };
 
 function fetchTextHttps(urlStr, headers = {}, maxHeaderSize = 65536, timeoutMs = 15000) {
     return new Promise((resolve, reject) => {
@@ -304,22 +306,8 @@ export function resetMinter(sessionToken = null) {
     return true;
 }
 
-function resolveTimezoneForCountry(gl) {
-    if (typeof gl !== 'string' || !gl.trim()) return null;
-    const code = gl.trim().toUpperCase();
-    const country = ct.getCountry?.(code) || ct.default?.getCountry?.(code);
-    if (country?.timezones?.length) {
-        return country.timezones[0];
-    }
-    try {
-        const locale = new Intl.Locale(`und-${code}`);
-        const zones = locale.getTimeZones?.() || locale.timeZones;
-        if (Array.isArray(zones) && zones.length > 0) {
-            return zones[0];
-        }
-    } catch {}
-    return null;
-}
+const INTERPRETER_CACHE_MAX = 8;
+const interpreterCache = new Map();
 
 async function syncTimezoneWithGeo(gl) {
     const targetTz = resolveTimezoneForCountry(gl);
@@ -672,11 +660,21 @@ export async function getWebPo(useYouTubeAPI = true, options = {}) {
             challenge.bgChallenge.interpreterJavascript?.privateDoNotAccessOrElseSafeScriptWrappedValue;
         let interpreter = inlineInterpreter || '';
         if (!interpreter && interpreterUrl) {
-            const interp_res = await fetch(`https:${interpreterUrl}`, {
-                headers: { 'user-agent': req_UA }
-            });
-            if (!interp_res.ok) throw new Error(`BotGuard interpreter returned ${interp_res.status}`);
-            interpreter = await interp_res.text();
+            if (interpreterCache.has(interpreterUrl)) {
+                interpreter = interpreterCache.get(interpreterUrl);
+            } else {
+                const interp_res = await fetch(`https:${interpreterUrl}`, {
+                    headers: { 'user-agent': req_UA }
+                });
+                if (!interp_res.ok) throw new Error(`BotGuard interpreter returned ${interp_res.status}`);
+                interpreter = await interp_res.text();
+                if (interpreter) {
+                    if (interpreterCache.size >= INTERPRETER_CACHE_MAX) {
+                        interpreterCache.delete(interpreterCache.keys().next().value);
+                    }
+                    interpreterCache.set(interpreterUrl, interpreter);
+                }
+            }
         }
 
         if (!interpreter) throw new Error("couldn't load botguard interpreter");
@@ -810,56 +808,4 @@ export async function fetch_pot(contentBinding, useYouTubeAPI = true, ttl = null
         }
         throw error;
     }
-}
-
-// this token only bridges the short period before yt moves sps from 2 to 3
-// its generated per response cuz it contains the current time
-export function createColdStartToken(contentBinding, clientState = 1) {
-    const bytecode = new TextEncoder().encode(contentBinding);
-
-    if (bytecode.length > COLD_START_MAX_BINDING_BYTES) return;
-
-    const timestamp = Math.floor(Date.now() / 1000);
-    const rand_keys = [Math.floor(Math.random() * 256), Math.floor(Math.random() * 256)];
-
-    const header = rand_keys.concat(
-        [0, clientState],
-        [(timestamp >> 24) & 0xff, (timestamp >> 16) & 0xff, (timestamp >> 8) & 0xff, timestamp & 0xff]
-    );
-
-    const packet = new Uint8Array(2 + header.length + bytecode.length);
-
-    packet[0] = 34;
-    packet[1] = header.length + bytecode.length;
-    packet.set(header, 2);
-    packet.set(bytecode, 2 + header.length);
-
-    const payload = packet.subarray(2);
-
-    for (let i = 2; i < payload.length; i++) payload[i] = payload[i] ^ payload[i % 2];
-
-    return Uint8ToBase64(packet, true);
-}
-
-export function decodeColdStartToken(token) {
-    const packet = base64ToUint8(token);
-
-    if (packet.length < 10 || packet[0] !== 34) throw new Error('invalid cold start token');
-
-    const length = packet[1];
-    if (packet.length !== length + 2 || length < 8) throw new Error('invalid cold start packet length');
-
-    const payload = packet.slice(2);
-    for (let i = 2; i < payload.length; i++) payload[i] = payload[i] ^ payload[i % 2];
-
-    const timestamp = ((payload[4] << 24) | (payload[5] << 16) | (payload[6] << 8) | payload[7]) >>> 0;
-
-    return {
-        contentBinding: new TextDecoder().decode(payload.subarray(8)),
-        timestamp,
-        unknownVal: payload[2],
-        clientState: payload[3],
-        keys: [payload[0], payload[1]],
-        date: new Date(timestamp * 1000)
-    };
 }
