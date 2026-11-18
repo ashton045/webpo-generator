@@ -323,7 +323,7 @@ function resolveTimezoneForCountry(gl) {
 
 async function syncTimezoneWithGeo(gl) {
     const targetTz = resolveTimezoneForCountry(gl);
-    if (!targetTz) return;
+    if (!targetTz || targetTz === 'UTC' || targetTz === 'Etc/UTC') return;
     try {
         const currentTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
         if (!currentTz || currentTz === 'UTC' || currentTz === 'Etc/UTC') {
@@ -331,7 +331,7 @@ async function syncTimezoneWithGeo(gl) {
             new Date().getTimezoneOffset();
             if (parentPort) {
                 parentPort.postMessage({ type: 'sync_tz', tz: targetTz });
-                await new Promise((resolve) => setTimeout(resolve, 15));
+                await new Promise((resolve) => setTimeout(resolve, 100));
             }
         }
     } catch {}

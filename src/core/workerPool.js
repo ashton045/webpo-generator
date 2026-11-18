@@ -14,18 +14,49 @@ export function createWorkerPool({
     const queue = [];
     let stopped = false;
 
+    function replaceWorkerForTimezone(item) {
+        if (item.failed || stopped) return;
+        item.failed = true;
+
+        const task = item.task;
+        if (task) {
+            clearTimeout(task.timer);
+            item.task = undefined;
+            item.busy = false;
+            queue.unshift(task);
+        }
+
+        const i = workers.indexOf(item);
+        if (i >= 0) workers.splice(i, 1);
+
+        try {
+            item.worker.terminate();
+        } catch {}
+
+        start();
+    }
+
     function start() {
         const item = {
             worker: workerFactory(),
             busy: false,
             task: undefined,
-            minterSession: null
+            minterSession: null,
+            tz: process.env.TZ || null
         };
 
         item.worker.on('message', (msg) => {
             if (msg?.type === 'sync_tz' && typeof msg.tz === 'string') {
-                process.env.TZ = msg.tz;
-                new Date().getTimezoneOffset();
+                if (process.env.TZ !== msg.tz) {
+                    process.env.TZ = msg.tz;
+                    new Date().getTimezoneOffset();
+                }
+                for (const w of [...workers]) {
+                    if (w.tz !== msg.tz && (!w.busy || w === item)) {
+                        replaceWorkerForTimezone(w);
+                    }
+                }
+                dispatch();
                 return;
             }
 
